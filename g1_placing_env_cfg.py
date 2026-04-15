@@ -126,7 +126,7 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     action_scale = 0.25  # 动作值范围：[-0.25, 0.25] 弧度
 
     # 关节目标变化率限制（抑制高频运动）：每步关节目标相对上步的最大变化（弧度），0=不限制
-    action_rate_limit_rad_per_step = 0.02  # 约 1.1°/step，decimation=2 时约 0.6 rad/s
+    action_rate_limit_rad_per_step = 0.04  # 约 2.3°/step，decimation=2 时约 1.2 rad/s
 
     torso_joint_limit_rad = 0.35  # 躯干关节（名称含 torso）奖励限位 ±rad；髋类限位见 URDF+soft_dof_pos_limit
     # 与 unitree_rl_gym ``g1_config.py`` 的 ``rewards.soft_dof_pos_limit`` 一致：在 URDF 全行程内缩窄后再计越界惩罚
@@ -136,7 +136,7 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     rew_scale_pitch_roll_angle = -0.5  # 放宽姿态惩罚，允许跨步过程中的合理前倾微调
     rew_scale_pitch_roll_ang_vel = -1e-3  # 俯仰/横滚角速度惩罚：scale * (pitch_ang_vel² + roll_ang_vel²)
     rew_scale_lin_vel_z = 0.0  # 关闭躯干 Z 轴速度惩罚
-    rew_scale_height = -2.0  # 根高度波动惩罚：偏离目标超过 height_penalty_band 时
+    rew_scale_height = -1.0  # 根高度波动惩罚：偏离目标超过 height_penalty_band 时
     height_target = 0.74  # 目标根高度（米）；与 G1_CFG 默认根高一致
     height_penalty_band = 0.05  # 允许波动范围（米），74cm±5cm 内无惩罚，即 [0.69, 0.79] m
     
@@ -145,7 +145,7 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     rew_scale_joint_acceleration = -1e-6  # 关节加速度惩罚（与宇树 legged_gym dof_acc 同型：控制步内 ‖Δq̇‖²）
 
     # 宇树官方移植的平滑与姿态惩罚
-    rew_scale_action_rate = -0.005  # 惩罚动作突变（进一步加重，强抑制抽搐）
+    rew_scale_action_rate = -0.0005  # 惩罚动作突变（回归合理防抖阈值）
     rew_scale_contact_no_vel = -2.0  # 加重防滑步惩罚，禁止贴地蹭
     # 宇树 legged_gym ``g1_env._reward_hip_pos``：左右髋 roll + yaw 绝对角平方和；12dof 对应 dof 索引 [1,2,7,8]
     rew_scale_hip_pos = -0.5
@@ -157,7 +157,7 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
 
     
     # 奖励参数 - 踩点组（目标点 z 为各 env 地面标高；命中时期望踝 z = 地面 + foot_ankle_ground_height）
-    rew_scale_foot_hit = 15.0  # 踩点奖励权重（严格命中时一次发放）
+    rew_scale_foot_hit = 30.0  # 踩点奖励权重（严格命中时一次发放）
     foot_hit_sigma = 0.03  # 高斯标准差（等效距离空间），越小越鼓励精确踩中
     foot_ankle_ground_height = 0.07  # 相对目标地面 z 的踝关节期望高度（米）
 
