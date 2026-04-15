@@ -1607,3 +1607,5 @@ def compute_rewards(
         rew_foot_hit,
         rew_joint_limit,
     )
+    
+    #你好呀
