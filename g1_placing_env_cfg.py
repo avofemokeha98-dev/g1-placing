@@ -52,8 +52,8 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     rew_scale_hip_pos = 0.0
     rew_scale_joint_limit = -1.0
     joint_limit_buffer = 0.1
-    rew_scale_foot_hit = 50.0
-    rew_scale_foot_path_tracking = 5.0
+    rew_scale_foot_hit = 20.0
+    rew_scale_foot_path_tracking = 10.0
     rew_scale_foot_hold = 2.0
     foot_hit_sigma = 0.03
     foot_ankle_ground_height = 0.07
