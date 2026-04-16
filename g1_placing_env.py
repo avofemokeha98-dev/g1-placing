@@ -12,13 +12,12 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.sensors import ContactSensor, ContactSensorCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, quat_apply_yaw, quat_inv, quat_mul, quat_rotate_inverse, sample_uniform
+from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, quat_apply_yaw, quat_from_angle_axis, quat_inv, quat_mul, quat_rotate_inverse, sample_uniform
 from .g1_placing_env_cfg import G1PlacingEnvCfg
 from .placing_joint_lock import apply_locked_joint_targets, collect_locked_joint_ids
 from .placing_joint_limits import reward_joint_limit_interval
 
 class G1PlacingEnv(DirectRLEnv):
-    """G1 踩点环境：矩形采样地面目标点、动态摆动相引导（滞空/离地/摆速）、踩点奖励与稳定性/平滑正则。"""
     cfg: G1PlacingEnvCfg
 
     def __init__(self, cfg: G1PlacingEnvCfg, render_mode: str | None=None, **kwargs):
@@ -37,6 +36,7 @@ class G1PlacingEnv(DirectRLEnv):
         self._path_start_updated_for_target: torch.Tensor | None = None
         self._aerial_hold_start_time: torch.Tensor | None = None
         self._target_markers: VisualizationMarkers | None = None
+        self._path_line_markers: VisualizationMarkers | None = None
         self._foot_contact_sensor: ContactSensor | None = None
         self._foot_contact_body_sensor_indices: torch.Tensor | None = None
         self._ankle_contact_consecutive_count: torch.Tensor | None = None
@@ -65,7 +65,6 @@ class G1PlacingEnv(DirectRLEnv):
             self._event_next_push_at = torch.zeros(self.num_envs, device=self.device)
 
     def _get_event_curriculum_phase(self) -> dict | None:
-        """由 common_step_counter 得到训练 iteration，减去 event_curriculum_base_iteration 后选阶段。"""
         if not getattr(self.cfg, 'event_curriculum_enabled', False):
             return None
         cur = getattr(self.cfg, 'event_curriculum', None)
@@ -132,7 +131,6 @@ class G1PlacingEnv(DirectRLEnv):
         self._event_next_push_at[env_ids] = t[env_ids] + interval
 
     def step(self, action: torch.Tensor) -> VecEnvStepReturn:
-        """与 DirectRLEnv.step 一致，但在 interval 处改为课程化推力（cfg.events 为 None 时使用）。"""
         action = action.to(self.device)
         if self.cfg.action_noise_model:
             action = self._action_noise_model.apply(action)
@@ -169,7 +167,6 @@ class G1PlacingEnv(DirectRLEnv):
         return (self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras)
 
     def _get_feet_body_ids(self) -> list:
-        """返回左右脚踝 body 索引（Articulation 内顺序，用于位姿与 ContactSensor 脚索引对齐）。"""
         (left_ankle_ids, _) = self.robot.find_bodies('.*left_ankle_roll_link')
         (right_ankle_ids, _) = self.robot.find_bodies('.*right_ankle_roll_link')
         feet_body_ids = []
@@ -182,7 +179,6 @@ class G1PlacingEnv(DirectRLEnv):
         return feet_body_ids
 
     def _resolve_foot_contact_sensor_body_indices(self) -> None:
-        """将 Articulation 左右踝 body 名映射到 ContactSensor 的 body 维索引（仅解析一次）。"""
         if self._foot_contact_body_sensor_indices is not None:
             return
         sensor = self._foot_contact_sensor
@@ -201,13 +197,6 @@ class G1PlacingEnv(DirectRLEnv):
         self._foot_contact_body_sensor_indices = torch.tensor(idxs, device=self.device, dtype=torch.long)
 
     def get_feet_contact_state(self) -> torch.Tensor | None:
-        """足部触地 (num_envs, 2) bool，左/右脚。
-
-        默认（``foot_contact_use_physics_sensor``）：与 H1 速度任务一致，用 ``ContactSensor`` 的
-        ``net_forces_w`` 范数与 ``foot_contact_force_threshold``（写入传感器的 ``force_threshold``）判定。
-
-        否则：脚踝高度 + 线速度 + 连续帧启发式。每步只更新一次并写 ``_feet_contact_cache``。
-        """
         feet_body_ids = self._get_feet_body_ids()
         if len(feet_body_ids) < 2:
             return None
@@ -277,6 +266,18 @@ class G1PlacingEnv(DirectRLEnv):
         target_marker_cfg = VisualizationMarkersCfg(prim_path='/Visuals/foot_target_markers', markers={'target': sim_utils.SphereCfg(radius=0.03, visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 1.0, 0.0)))})
         self._target_markers = VisualizationMarkers(target_marker_cfg)
         self._target_markers.set_visibility(True)
+        path_line_cfg = VisualizationMarkersCfg(
+            prim_path='/Visuals/foot_path_line_markers',
+            markers={
+                'path_line': sim_utils.CylinderCfg(
+                    radius=0.004,
+                    height=1.0,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 1.0)),
+                )
+            },
+        )
+        self._path_line_markers = VisualizationMarkers(path_line_cfg)
+        self._path_line_markers.set_visibility(True)
         self._reward_components = ['rew_pitch_roll_angle', 'rew_pitch_roll_ang_vel', 'rew_height', 'rew_joint_velocity', 'rew_joint_acceleration', 'rew_foot_hit', 'rew_foot_path_tracking', 'rew_foot_orientation', 'rew_foot_hold', 'rew_joint_limit', 'rew_action_rate', 'rew_contact_no_vel', 'rew_hip_pos']
         self._episode_reward_sums = {name: torch.zeros(num_envs, dtype=torch.float32, device=self.device) for name in self._reward_components}
         self._last_episode_reward_means = {name: 0.0 for name in self._reward_components}
@@ -296,12 +297,6 @@ class G1PlacingEnv(DirectRLEnv):
         self._update_target_markers()
 
     def _update_target_markers(self) -> None:
-        """更新目标点位可视化标记，使小球正确反映当前点位世界坐标位置。
-
-        每步先 _check_and_generate_targets 再本函数，故刷新后同一步内即更新。
-        固定传入 num_envs 个位置（float32），保证 PointInstancer 实例数稳定、每次都能刷新；
-        无目标的环境用 (0,0,-100) 置于地下；每次同时传 marker_indices 以强制视图更新。
-        """
         if self._target_markers is None or self._foot_target_positions is None:
             return
         num_envs = self._foot_target_positions.shape[0]
@@ -310,6 +305,73 @@ class G1PlacingEnv(DirectRLEnv):
         marker_positions[~has_valid] = torch.tensor((0.0, 0.0, -100.0), device=self.device, dtype=marker_positions.dtype)
         trans_np = marker_positions.detach().cpu().float().numpy()
         self._target_markers.visualize(translations=trans_np, marker_indices=np.zeros(num_envs, dtype=np.int32))
+        self._update_path_line_markers()
+
+    def _update_path_line_markers(self) -> None:
+        if self._path_line_markers is None:
+            return
+        if self._foot_target_positions is None or self._swing_foot_path_start is None or self._target_generation_time is None:
+            return
+        env_id = 0
+        if env_id >= self.num_envs or self._target_generation_time[env_id] <= float('-inf'):
+            off = np.array([[0.0, 0.0, -100.0]], dtype=np.float32)
+            self._path_line_markers.visualize(
+                translations=off,
+                orientations=np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32),
+                scales=np.array([[1.0, 1.0, 1.0]], dtype=np.float32),
+                marker_indices=np.zeros(1, dtype=np.int32),
+            )
+            return
+        start = self._swing_foot_path_start[env_id]
+        target = self._foot_target_positions[env_id]
+        base_h = float(getattr(self.cfg, 'foot_ankle_ground_height', 0.07))
+        aerial_thresh = float(getattr(self.cfg, 'foot_target_aerial_ground_threshold', 0.075))
+        target_z = target[2]
+        end_z = target_z if target_z > aerial_thresh else torch.tensor(base_h, device=self.device, dtype=target.dtype)
+        dist_xy = torch.norm(target[:2] - start[:2]).clamp(min=1e-4)
+        dist_min = float(getattr(self.cfg, 'foot_target_min_distance', 0.25))
+        dist_max = float(getattr(self.cfg, 'foot_target_max_distance', 0.40))
+        peak_min = float(getattr(self.cfg, 'foot_path_peak_height_min', 0.10))
+        peak_max = float(getattr(self.cfg, 'foot_path_peak_height_max', 0.15))
+        dist_ratio = ((dist_xy - dist_min) / (dist_max - dist_min + 1e-6)).clamp(0.0, 1.0)
+        peak_h = peak_min + (peak_max - peak_min) * dist_ratio
+        n_pts = 21
+        t = torch.linspace(0.0, 1.0, n_pts, device=self.device, dtype=target.dtype)
+        ref_xy = (1.0 - t).unsqueeze(1) * start[:2].unsqueeze(0) + t.unsqueeze(1) * target[:2].unsqueeze(0)
+        ref_z_ground = (base_h + (peak_h - base_h) * torch.sin(t * np.pi)).unsqueeze(1)
+        if target_z > aerial_thresh:
+            ref_z = ref_z_ground * (1.0 - t).unsqueeze(1) + end_z * t.unsqueeze(1)
+        else:
+            ref_z = ref_z_ground
+        pts = torch.cat([ref_xy, ref_z], dim=1)
+        p0 = pts[:-1]
+        p1 = pts[1:]
+        seg = p1 - p0
+        seg_len = torch.norm(seg, dim=1).clamp(min=1e-6)
+        mid = 0.5 * (p0 + p1)
+        z_axis = torch.tensor([0.0, 0.0, 1.0], device=self.device, dtype=pts.dtype).unsqueeze(0).expand_as(seg)
+        dir_unit = seg / seg_len.unsqueeze(1)
+        axis = torch.cross(z_axis, dir_unit, dim=1)
+        axis_norm = torch.norm(axis, dim=1, keepdim=True)
+        fallback_axis = torch.tensor([1.0, 0.0, 0.0], device=self.device, dtype=pts.dtype).unsqueeze(0).expand_as(axis)
+        axis_unit = torch.where(axis_norm > 1e-6, axis / axis_norm.clamp(min=1e-6), fallback_axis)
+        dot = torch.clamp(torch.sum(z_axis * dir_unit, dim=1), -1.0, 1.0)
+        angle = torch.acos(dot)
+        orient = quat_from_angle_axis(angle, axis_unit)
+        scales = torch.stack(
+            [
+                torch.full_like(seg_len, 1.0),
+                torch.full_like(seg_len, 1.0),
+                seg_len,
+            ],
+            dim=1,
+        )
+        self._path_line_markers.visualize(
+            translations=mid.detach().cpu().float().numpy(),
+            orientations=orient.detach().cpu().float().numpy(),
+            scales=scales.detach().cpu().float().numpy(),
+            marker_indices=np.zeros(seg_len.shape[0], dtype=np.int32),
+        )
 
     def _initialize_locked_joints(self):
         if self._locked_joint_initialized:
@@ -331,7 +393,6 @@ class G1PlacingEnv(DirectRLEnv):
         self._joint_limit_initialized = True
 
     def _initialize_hip_pos_penalty_joints(self) -> None:
-        """与宇树 ``g1_env._reward_hip_pos`` 一致：惩罚 Σ q²（髋 roll、髋 yaw，不含 pitch）。"""
         if self._hip_pos_joint_initialized:
             return
         ids: list[int] = []
@@ -346,12 +407,6 @@ class G1PlacingEnv(DirectRLEnv):
         self._hip_pos_joint_initialized = True
 
     def _apply_action(self) -> None:
-        """应用动作到机器人
-
-        动作为相对参考姿态的增量：target = reference_pose + action * action_scale。
-        参考姿态与 reset 一致（default + 双膝微屈），避免第一步就命令到 [−0.25,0.25] 绝对位姿导致突然伸膝/飞起。
-        锁死关节（脚踝、肩部等）保持默认位置。
-        """
         self._initialize_locked_joints()
         default_pos = self.robot.data.default_joint_pos.clone()
         joint_pos_target = default_pos + self.actions * self.cfg.action_scale
@@ -369,15 +424,6 @@ class G1PlacingEnv(DirectRLEnv):
         self.robot.set_joint_position_target(joint_pos_target, joint_ids=None)
 
     def _get_observations(self) -> dict:
-        """获取观察值（106维）
-
-        观察空间组成：
-        - root状态：位置(3) + 朝向(4) + 线速度(3) + 角速度(3) = 13维
-        - 关节状态：位置(37) + 速度(37) = 74维
-        - 目标点：相对根的位置(3)；无有效目标（``_foot_target_positions`` 全 0）时为当前摆动脚脚踝在根系下位置
-        - 脚部状态：接触(2) + 位置(6) + 朝向(8) = 16维
-        总计：106维
-        """
         self._feet_contact_cache = None
         root_pos = self.robot.data.root_pos_w
         root_quat = self.robot.data.root_quat_w
@@ -441,9 +487,6 @@ class G1PlacingEnv(DirectRLEnv):
         return reference_states
 
     def _generate_follow_target(self, env_ids: torch.Tensor, hit_foot_indices: torch.Tensor) -> None:
-        """生成跟随点：另一脚跟上，保持双腿 24cm 间距。
-        核心修复：使用 Root 横向（body Y 轴）进行平移，确保双脚并排站立，而非前后错开。
-        """
         if len(env_ids) == 0:
             return
         feet_body_ids = self._get_feet_body_ids()
@@ -477,9 +520,6 @@ class G1PlacingEnv(DirectRLEnv):
             self._aerial_hold_start_time[env_ids] = float('-inf')
 
     def _generate_random_target(self, env_ids: torch.Tensor, *, alternate_swing: bool=False) -> None:
-        """点位生成器：随机目标为脚踝周围 body 系矩形（前/后/横向见 cfg），z 为各 env 地面标高；与跟随点（24cm）交替。
-        序列：左脚踩目标 → 右脚跟（24cm）→ 右脚踩目标 → 左脚跟（24cm）→ ...
-        """
         if len(env_ids) == 0:
             return
         if self._target_regenerate_deadline is not None:
@@ -534,7 +574,6 @@ class G1PlacingEnv(DirectRLEnv):
             self._swing_air_accum_s[env_ids] = 0.0
 
     def _generate_random_target_internal(self, env_ids: torch.Tensor, swing_foot_indices: torch.Tensor, root_quat: torch.Tensor, left_foot_xy: torch.Tensor, right_foot_xy: torch.Tensor) -> None:
-        """内部：在摆动脚踝处 body 系矩形内均匀采样地面目标点（z = 该 env 地面世界坐标，与 env_origins.z 一致）。"""
         num_generate = len(env_ids)
         center_xy = torch.where(swing_foot_indices.unsqueeze(1).expand(-1, 2) == 0, left_foot_xy, right_foot_xy)
         target_z = self.scene.env_origins[env_ids, 2]
@@ -873,61 +912,18 @@ class G1PlacingEnv(DirectRLEnv):
                         path_started = torch.ones(num_envs, dtype=torch.bool, device=self.device)
                     base_h = getattr(self.cfg, 'foot_ankle_ground_height', 0.07)
                     sigma = getattr(self.cfg, 'foot_path_tracking_sigma', 0.025)
-                    mode = getattr(self.cfg, 'foot_path_mode', 'bezier')
                     aerial_target_path = (target_z > aerial_thresh) & has_target
-                    end_z = torch.where(aerial_target_path.unsqueeze(1), target_z.unsqueeze(1), torch.full_like(end_xy[:, :1], base_h))
-                    if mode == 'bezier':
-                        dist_min = getattr(self.cfg, 'foot_target_min_distance', 0.05)
-                        dist_max = getattr(self.cfg, 'foot_target_max_distance', 0.25)
-                        peak_min = getattr(self.cfg, 'foot_path_peak_height_min', 0.13)
-                        peak_max = getattr(self.cfg, 'foot_path_peak_height_max', 0.18)
-                        dist_ratio = ((initial_dist_xy - dist_min) / (dist_max - dist_min + 1e-06)).clamp(0.0, 1.0)
-                        peak_h = peak_min + (peak_max - peak_min) * dist_ratio
-                        D = initial_dist_xy
-                        dir_xy = (end_xy - start_xy) / initial_dist_xy.unsqueeze(1)
-                        P0 = torch.cat([start_xy, torch.full_like(start_xy[:, :1], base_h)], dim=1)
-                        P1 = torch.cat([start_xy + 0.15 * D.unsqueeze(1) * dir_xy, peak_h.unsqueeze(1)], dim=1)
-                        P2 = torch.cat([end_xy - 0.15 * D.unsqueeze(1) * dir_xy, (peak_h * 0.8).unsqueeze(1)], dim=1)
-                        P3 = torch.cat([end_xy, end_z], dim=1)
-                        u = 1.0 - t
-                        ref_pos = (u ** 3).unsqueeze(1) * P0 + 3.0 * (u ** 2 * t).unsqueeze(1) * P1 + 3.0 * (u * t ** 2).unsqueeze(1) * P2 + (t ** 3).unsqueeze(1) * P3
-                    elif mode == 'humanoid':
-                        t1 = getattr(self.cfg, 'foot_path_lift_phase_ratio', 0.35)
-                        t2 = getattr(self.cfg, 'foot_path_extend_phase_ratio', 0.75)
-                        lift_h = getattr(self.cfg, 'foot_path_lift_height', 0.1)
-                        D = initial_dist_xy
-                        dir_xy = (end_xy - start_xy) / initial_dist_xy.unsqueeze(1)
-                        x1 = t1 * D
-                        psi_max = 2.0 * torch.atan(x1 / (lift_h + 1e-06)).clamp(0.01, 1.56)
-                        R = lift_h / (torch.sin(psi_max) + 1e-06)
-                        x_arc = R * (1.0 - torch.cos(psi_max * (t / (t1 + 1e-06)).clamp(0.0, 1.0)))
-                        z_arc = R * torch.sin(psi_max * (t / (t1 + 1e-06)).clamp(0.0, 1.0))
-                        in_phase1 = t <= t1
-                        in_phase2 = (t > t1) & (t <= t2)
-                        in_phase3 = t > t2
-                        x_local = torch.where(in_phase1, x_arc, torch.full_like(t, 0.0))
-                        x_local = torch.where(in_phase2, D * t, x_local)
-                        x_local = torch.where(in_phase3, D * t, x_local)
-                        z_local = torch.where(in_phase1, z_arc, torch.full_like(t, 0.0))
-                        z_extend = lift_h + (base_h + 0.02 - lift_h) * ((t - t1) / (t2 - t1 + 1e-06)).clamp(0.0, 1.0)
-                        z_land = base_h + 0.02 - 0.02 * ((t - t2) / (1.0 - t2 + 1e-06)).clamp(0.0, 1.0)
-                        z_local = torch.where(in_phase2, z_extend, z_local)
-                        z_local = torch.where(in_phase3, z_land, z_local)
-                        ref_xy = start_xy + x_local.unsqueeze(1) * dir_xy
-                        ref_z_ground = (base_h + z_local).unsqueeze(1)
-                        ref_z = torch.where(aerial_target_path.unsqueeze(1), ref_z_ground * (1 - t).unsqueeze(1) + target_z.unsqueeze(1) * t.unsqueeze(1), ref_z_ground)
-                        ref_pos = torch.cat([ref_xy, ref_z], dim=1)
-                    else:
-                        dist_min = getattr(self.cfg, 'foot_target_min_distance', 0.05)
-                        dist_max = getattr(self.cfg, 'foot_target_max_distance', 0.25)
-                        peak_min = getattr(self.cfg, 'foot_path_peak_height_min', 0.13)
-                        peak_max = getattr(self.cfg, 'foot_path_peak_height_max', 0.18)
-                        dist_ratio = ((initial_dist_xy - dist_min) / (dist_max - dist_min + 1e-06)).clamp(0.0, 1.0)
-                        peak_h = peak_min + (peak_max - peak_min) * dist_ratio
-                        ref_xy = (1 - t).unsqueeze(1) * start_xy + t.unsqueeze(1) * end_xy
-                        ref_z_ground = (base_h + (peak_h - base_h) * torch.sin(t * 3.14159265)).unsqueeze(1)
-                        ref_z = torch.where(aerial_target_path.unsqueeze(1), ref_z_ground * (1 - t).unsqueeze(1) + target_z.unsqueeze(1) * t.unsqueeze(1), ref_z_ground)
-                        ref_pos = torch.cat([ref_xy, ref_z], dim=1)
+                    # 统一采用 placing11 的摆线轨迹：xy 线性插值 + z 正弦拱线（空中目标时与目标 z 线性混合）
+                    dist_min = getattr(self.cfg, 'foot_target_min_distance', 0.25)
+                    dist_max = getattr(self.cfg, 'foot_target_max_distance', 0.40)
+                    peak_min = getattr(self.cfg, 'foot_path_peak_height_min', 0.10)
+                    peak_max = getattr(self.cfg, 'foot_path_peak_height_max', 0.15)
+                    dist_ratio = ((initial_dist_xy - dist_min) / (dist_max - dist_min + 1e-06)).clamp(0.0, 1.0)
+                    peak_h = peak_min + (peak_max - peak_min) * dist_ratio
+                    ref_xy = (1 - t).unsqueeze(1) * start_xy + t.unsqueeze(1) * end_xy
+                    ref_z_ground = (base_h + (peak_h - base_h) * torch.sin(t * 3.14159265)).unsqueeze(1)
+                    ref_z = torch.where(aerial_target_path.unsqueeze(1), ref_z_ground * (1 - t).unsqueeze(1) + target_z.unsqueeze(1) * t.unsqueeze(1), ref_z_ground)
+                    ref_pos = torch.cat([ref_xy, ref_z], dim=1)
                     dist_to_ref = torch.norm(swing_foot_pos - ref_pos, dim=1)
                     raw_reward = torch.exp(-0.5 * torch.square(dist_to_ref / sigma))
                     if use_start_on_lift and self._path_start_time is not None:

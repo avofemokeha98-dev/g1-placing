@@ -46,9 +46,9 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     height_penalty_band = 0.05
     rew_scale_joint_velocity = -0.001
     rew_scale_joint_acceleration = -1e-06
-    rew_scale_action_rate = -0.0005
+    rew_scale_action_rate = 0.0
     rew_scale_contact_no_vel = -2.0
-    rew_scale_hip_pos = -0.5
+    rew_scale_hip_pos = 0.0
     rew_scale_joint_limit = -5.0
     joint_limit_buffer = 0.1
     rew_scale_foot_hit = 50.0
@@ -63,7 +63,6 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     foot_path_progress_mode: str = 'time'
     foot_path_duration_base_s = 0.55
     foot_path_duration_per_m = 0.8
-    foot_path_mode: str = 'bezier'
     foot_path_start_on_lift = True
     foot_path_lift_phase_ratio = 0.35
     foot_path_extend_phase_ratio = 0.75
