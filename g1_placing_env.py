@@ -865,17 +865,24 @@ class G1PlacingEnv(DirectRLEnv):
                 foot_hit_reward = torch.where(reward_frame, hit_reward_base, torch.zeros_like(hit_reward_base))
                 if self._foot_land_rewarded is not None:
                     self._foot_land_rewarded = self._foot_land_rewarded | landing_evidence
-                delay_s = float(getattr(self.cfg, 'foot_target_regenerate_delay_s', 0.5))
+                # =====================================================================
+                # 核心优化：动态跟步延迟 (Dynamic Follow-up Delay)
+                # =====================================================================
+                delay_base = float(getattr(self.cfg, 'foot_target_regenerate_delay_s', 0.5))
+
+                # 如果下一步是跟步(is_next_follow为True)，给一个极短的0.05s缓冲让物理引擎结算，然后立刻出脚；
+                # 如果双腿已经合拢，准备迈出全新的随机步，则正常停顿 delay_base 秒
+                is_next_follow = self._next_is_follow if hasattr(self, '_next_is_follow') else torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+                delay_tensor = torch.where(is_next_follow, torch.tensor(0.05, device=self.device), torch.tensor(delay_base, device=self.device))
+
                 skip_tm = self._user_target_mode if self._user_target_mode is not None else torch.zeros(num_envs, dtype=torch.bool, device=self.device)
                 user_hit = hit_target & skip_tm
                 auto_hit = hit_target & ~skip_tm
-                if delay_s > 0.0:
-                    self._target_hit = self._target_hit | user_hit
-                    if self._target_regenerate_deadline is not None:
-                        sched = auto_hit & torch.isnan(self._target_regenerate_deadline)
-                        self._target_regenerate_deadline = torch.where(sched, current_time + delay_s, self._target_regenerate_deadline)
-                else:
-                    self._target_hit = self._target_hit | hit_target
+
+                self._target_hit = self._target_hit | user_hit
+                if self._target_regenerate_deadline is not None:
+                    sched = auto_hit & torch.isnan(self._target_regenerate_deadline)
+                    self._target_regenerate_deadline = torch.where(sched, current_time + delay_tensor, self._target_regenerate_deadline)
                 if self._last_touchdown_time is not None:
                     self._last_touchdown_time = torch.where(landing_evidence, current_time, self._last_touchdown_time)
                 aerial_thresh = getattr(self.cfg, 'foot_target_aerial_ground_threshold', 0.075)
