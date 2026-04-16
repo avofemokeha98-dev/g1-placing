@@ -35,7 +35,7 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     event_torso_body_names: tuple[str, ...] = ('^left_elbow_roll_link$', '^right_elbow_roll_link$')
     event_curriculum: tuple = ({'iter_start': 0, 'iter_end': 5000, 'mass_add_kg': (0.5, 1.5), 'push_enabled': False}, {'iter_start': 5000, 'iter_end': 10000, 'mass_add_kg': (1.0, 2.5), 'push_enabled': True, 'push_xy': 0.15, 'push_z': 0.05}, {'iter_start': 10000, 'iter_end': None, 'mass_add_kg': (0.5, 2.5), 'push_enabled': True, 'push_xy': 0.25, 'push_z': 0.05})
     action_scale = 0.25
-    action_rate_limit_rad_per_step = 0.02
+    action_rate_limit_rad_per_step = 0.05
     torso_joint_limit_rad = 0.35
     soft_dof_pos_limit = 0.9
     rew_scale_pitch_roll_angle = -0.5
@@ -47,13 +47,12 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     rew_scale_joint_velocity = -0.001
     rew_scale_joint_acceleration = -1e-06
     rew_scale_action_rate = 0.0
-    rew_scale_contact_no_vel = -2.0
+    rew_scale_contact_no_vel = -0.5
     rew_scale_hip_pos = 0.0
-    rew_scale_joint_limit = -5.0
+    rew_scale_joint_limit = -1.0
     joint_limit_buffer = 0.1
     rew_scale_foot_hit = 50.0
     rew_scale_foot_path_tracking = 5.0
-    rew_scale_foot_orientation = -0.5
     rew_scale_foot_hold = 2.0
     foot_hit_sigma = 0.03
     foot_ankle_ground_height = 0.07
@@ -81,8 +80,8 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     foot_contact_velocity_threshold = 0.08
     foot_target_hit_threshold = 0.08
     foot_target_hit_threshold_end = 0.03
-    foot_target_hit_threshold_iter_start = 1500
-    foot_target_hit_threshold_iter_end = 5000
+    foot_target_hit_threshold_iter_start = 3000
+    foot_target_hit_threshold_iter_end = 8000
     foot_target_hit_z_tolerance = 0.04
     foot_target_hit_z_contact_slack = 0.02
     foot_target_hit_z_max = 0.09
@@ -98,4 +97,4 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     reset_root_height = 0.74
     reward_curriculum_mode = 'iteration'
     reward_curriculum_steps_per_iteration = 24
-    reward_curriculum = [{'iter_start': 0, 'iter_end': 3000, 'components': ['rew_pitch_roll_angle', 'rew_pitch_roll_ang_vel', 'rew_height', 'rew_joint_velocity', 'rew_joint_acceleration', 'rew_joint_limit', 'rew_action_rate', 'rew_contact_no_vel', 'rew_hip_pos']}, {'iter_start': 3000, 'iter_end': None, 'components': ['rew_pitch_roll_angle', 'rew_pitch_roll_ang_vel', 'rew_height', 'rew_joint_velocity', 'rew_joint_acceleration', 'rew_joint_limit', 'rew_foot_hit', 'rew_foot_path_tracking', 'rew_foot_orientation', 'rew_foot_hold', 'rew_action_rate', 'rew_contact_no_vel', 'rew_hip_pos']}]
+    reward_curriculum = [{'iter_start': 0, 'iter_end': 3000, 'components': ['rew_pitch_roll_angle', 'rew_pitch_roll_ang_vel', 'rew_height', 'rew_joint_velocity', 'rew_joint_acceleration', 'rew_joint_limit', 'rew_action_rate', 'rew_contact_no_vel', 'rew_hip_pos']}, {'iter_start': 3000, 'iter_end': None, 'components': ['rew_pitch_roll_angle', 'rew_pitch_roll_ang_vel', 'rew_height', 'rew_joint_velocity', 'rew_joint_acceleration', 'rew_joint_limit', 'rew_foot_hit', 'rew_foot_path_tracking', 'rew_foot_hold', 'rew_action_rate', 'rew_contact_no_vel', 'rew_hip_pos']}]
