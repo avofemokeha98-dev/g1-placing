@@ -334,7 +334,6 @@ class G1PlacingEnv(DirectRLEnv):
         base_h = float(getattr(self.cfg, 'foot_ankle_ground_height', 0.07))
         aerial_thresh = float(getattr(self.cfg, 'foot_target_aerial_ground_threshold', 0.075))
         target_z = target[2]
-        end_z = target_z if target_z > aerial_thresh else torch.tensor(base_h, device=self.device, dtype=target.dtype)
         dist_xy = torch.norm(target[:2] - start[:2]).clamp(min=1e-4)
         dist_min = float(getattr(self.cfg, 'foot_target_min_distance', 0.25))
         dist_max = float(getattr(self.cfg, 'foot_target_max_distance', 0.40))
@@ -344,10 +343,22 @@ class G1PlacingEnv(DirectRLEnv):
         peak_h = peak_min + (peak_max - peak_min) * dist_ratio
         n_pts = 21
         t = torch.linspace(0.0, 1.0, n_pts, device=self.device, dtype=target.dtype)
-        ref_xy = (1.0 - t).unsqueeze(1) * start[:2].unsqueeze(0) + t.unsqueeze(1) * target[:2].unsqueeze(0)
-        ref_z_ground = (base_h + (peak_h - base_h) * torch.sin(t * np.pi)).unsqueeze(1)
+        # XY 五次多项式
+        t_xy = 10 * t**3 - 15 * t**4 + 6 * t**5
+        ref_xy = (1.0 - t_xy).unsqueeze(1) * start[:2].unsqueeze(0) + t_xy.unsqueeze(1) * target[:2].unsqueeze(0)
+
+        # Z 三次贝塞尔 (仅用于地面到地面连线可视化)
+        p0_z = torch.full((n_pts, 1), base_h, device=self.device, dtype=target.dtype)
+        p3_z = torch.full((n_pts, 1), base_h, device=self.device, dtype=target.dtype)
+        pull_factor = 1.6
+        p1_z = p0_z + (peak_h - base_h) * pull_factor
+        p2_z = p3_z + (peak_h - base_h) * pull_factor
+
+        t_z = t.unsqueeze(1)
+        inv_t = 1.0 - t_z
+        ref_z_ground = (inv_t**3) * p0_z + 3 * (inv_t**2) * t_z * p1_z + 3 * inv_t * (t_z**2) * p2_z + (t_z**3) * p3_z
         if target_z > aerial_thresh:
-            ref_z = ref_z_ground * (1.0 - t).unsqueeze(1) + end_z * t.unsqueeze(1)
+            ref_z = ref_z_ground * (1.0 - t_z) + target_z.unsqueeze(0).unsqueeze(1) * t_z
         else:
             ref_z = ref_z_ground
         pts = torch.cat([ref_xy, ref_z], dim=1)
