@@ -41,13 +41,14 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     rew_scale_pitch_roll_angle = -0.5
     rew_scale_pitch_roll_ang_vel = -0.001
     rew_scale_pitch_roll_swing_extra = 0.5
-    rew_scale_height = -1.0
+    rew_scale_height = -5.0
     height_target = 0.74
     height_penalty_band = 0.05
     rew_scale_joint_velocity = -0.001
-    rew_scale_joint_acceleration = -1e-06
-    rew_scale_action_rate = 0.0
-    rew_scale_contact_no_vel = -0.5
+    rew_scale_joint_acceleration = -1e-07
+    rew_scale_action_rate = -0.001
+    rew_scale_action_smoothness = -1e-4
+    rew_scale_contact_no_vel = -0.05
     rew_scale_hip_pos = 0.0
     rew_scale_joint_limit = -1.0
     joint_limit_buffer = 0.1
@@ -59,6 +60,10 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     foot_path_peak_height_min = 0.13
     foot_path_peak_height_max = 0.18
     foot_path_tracking_sigma = 0.025
+    foot_path_tracking_sigma_start = 0.075
+    foot_path_tracking_sigma_end = 0.025
+    foot_path_tracking_sigma_iter_start = 3000
+    foot_path_tracking_sigma_iter_end = 13000
     foot_path_progress_mode: str = 'time'
     foot_path_duration_base_s = 0.55
     foot_path_duration_per_m = 0.8
@@ -97,4 +102,4 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     reset_root_height = 0.74
     reward_curriculum_mode = 'iteration'
     reward_curriculum_steps_per_iteration = 24
-    reward_curriculum = [{'iter_start': 0, 'iter_end': 3000, 'components': ['rew_pitch_roll_angle', 'rew_pitch_roll_ang_vel', 'rew_height', 'rew_joint_velocity', 'rew_joint_acceleration', 'rew_joint_limit', 'rew_action_rate', 'rew_contact_no_vel', 'rew_hip_pos']}, {'iter_start': 3000, 'iter_end': None, 'components': ['rew_pitch_roll_angle', 'rew_pitch_roll_ang_vel', 'rew_height', 'rew_joint_velocity', 'rew_joint_acceleration', 'rew_joint_limit', 'rew_foot_hit', 'rew_foot_path_tracking', 'rew_foot_hold', 'rew_action_rate', 'rew_contact_no_vel', 'rew_hip_pos']}]
+    reward_curriculum = [{'iter_start': 0, 'iter_end': 3000, 'components': ['rew_pitch_roll_angle', 'rew_pitch_roll_ang_vel', 'rew_height', 'rew_joint_velocity', 'rew_joint_acceleration', 'rew_joint_limit', 'rew_action_rate', 'rew_action_smoothness', 'rew_contact_no_vel', 'rew_hip_pos']}, {'iter_start': 3000, 'iter_end': None, 'components': ['rew_pitch_roll_angle', 'rew_pitch_roll_ang_vel', 'rew_height', 'rew_joint_velocity', 'rew_joint_acceleration', 'rew_joint_limit', 'rew_foot_hit', 'rew_foot_path_tracking', 'rew_foot_hold', 'rew_action_rate', 'rew_action_smoothness', 'rew_contact_no_vel', 'rew_hip_pos']}]

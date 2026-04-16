@@ -50,6 +50,7 @@ class G1PlacingEnv(DirectRLEnv):
         self._aerial_hold_start_time = torch.full((self.num_envs,), float('-inf'), device=self.device)
         self._prev_joint_vel = None
         self._prev_actions = None
+        self._prev_prev_actions = None
         self._locked_joint_ids = None
         self._locked_joint_initialized = False
         self._ankle_locked_angle_pitch = 0.0
@@ -278,18 +279,24 @@ class G1PlacingEnv(DirectRLEnv):
         )
         self._path_line_markers = VisualizationMarkers(path_line_cfg)
         self._path_line_markers.set_visibility(True)
-        self._reward_components = ['rew_pitch_roll_angle', 'rew_pitch_roll_ang_vel', 'rew_height', 'rew_joint_velocity', 'rew_joint_acceleration', 'rew_foot_hit', 'rew_foot_path_tracking', 'rew_foot_hold', 'rew_joint_limit', 'rew_action_rate', 'rew_contact_no_vel', 'rew_hip_pos']
+        self._reward_components = ['rew_pitch_roll_angle', 'rew_pitch_roll_ang_vel', 'rew_height', 'rew_joint_velocity', 'rew_joint_acceleration', 'rew_foot_hit', 'rew_foot_path_tracking', 'rew_foot_hold', 'rew_joint_limit', 'rew_action_rate', 'rew_action_smoothness', 'rew_contact_no_vel', 'rew_hip_pos']
         self._episode_reward_sums = {name: torch.zeros(num_envs, dtype=torch.float32, device=self.device) for name in self._reward_components}
         self._last_episode_reward_means = {name: 0.0 for name in self._reward_components}
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         if hasattr(self, 'actions') and self.actions is not None:
             if self._prev_actions is not None:
+                self._prev_prev_actions = self._prev_actions.clone()
+            elif self._prev_prev_actions is None:
+                self._prev_prev_actions = self.actions.clone()
+            if self._prev_actions is not None:
                 self._prev_actions = self.actions.clone()
             else:
                 self._prev_actions = self.actions.clone()
         elif self._prev_actions is None:
             self._prev_actions = actions.clone()
+            if self._prev_prev_actions is None:
+                self._prev_prev_actions = actions.clone()
         self.actions = actions.clone()
         if getattr(self.cfg, 'force_zero_action', False):
             self.actions.zero_()
@@ -581,7 +588,6 @@ class G1PlacingEnv(DirectRLEnv):
         x_forward = getattr(self.cfg, 'foot_target_rect_x_forward', 0.3)
         y_outward = getattr(self.cfg, 'foot_target_rect_y_outward', 0.15)
         y_inward = getattr(self.cfg, 'foot_target_rect_y_inward', 0.02)
-        is_idle = torch.rand(num_generate, device=self.device) < 0.1
         local_x = sample_uniform(-x_back, x_forward, (num_generate,), self.device)
         is_left_foot = swing_foot_indices == 0
         y_min = torch.where(is_left_foot, torch.full((num_generate,), -y_inward, device=self.device, dtype=center_xy.dtype), torch.full((num_generate,), -y_outward, device=self.device, dtype=center_xy.dtype))
@@ -597,8 +603,6 @@ class G1PlacingEnv(DirectRLEnv):
         local_y = torch.where(too_close, local_y * scale, local_y)
         local_x = torch.clamp(local_x, -x_back, x_forward)
         local_y = torch.max(torch.min(local_y, y_max), y_min)
-        local_x = torch.where(is_idle, torch.zeros_like(local_x), local_x)
-        local_y = torch.where(is_idle, torch.zeros_like(local_y), local_y)
         local_positions = torch.stack([local_x, local_y, torch.zeros(num_generate, device=self.device, dtype=center_xy.dtype)], dim=1)
         world_offset = quat_apply_yaw(root_quat, local_positions)
         target_positions = torch.zeros(num_generate, 3, device=self.device, dtype=center_xy.dtype)
@@ -751,6 +755,22 @@ class G1PlacingEnv(DirectRLEnv):
             return thresh_end
         t = (iter_cur - iter_start) / max(1, iter_end - iter_start)
         return thresh_start + t * (thresh_end - thresh_start)
+
+    def _foot_path_tracking_sigma_m(self) -> float:
+        """轨迹跟踪高斯 sigma（米）。iter < iter_start 固定 sigma_start；iter_start～iter_end 线性收到 sigma_end；iter >= iter_end 固定 sigma_end。"""
+        step = getattr(self, 'common_step_counter', 0)
+        steps_per_iter = getattr(self.cfg, 'reward_curriculum_steps_per_iteration', 24)
+        iter_cur = step // max(1, steps_per_iter)
+        iter_start = getattr(self.cfg, 'foot_path_tracking_sigma_iter_start', 3000)
+        iter_end = getattr(self.cfg, 'foot_path_tracking_sigma_iter_end', 13000)
+        sigma_start = float(getattr(self.cfg, 'foot_path_tracking_sigma_start', 0.075))
+        sigma_end = float(getattr(self.cfg, 'foot_path_tracking_sigma_end', getattr(self.cfg, 'foot_path_tracking_sigma', 0.025)))
+        if iter_cur < iter_start:
+            return sigma_start
+        if iter_cur >= iter_end:
+            return sigma_end
+        t = (iter_cur - iter_start) / max(1, iter_end - iter_start)
+        return sigma_start + t * (sigma_end - sigma_start)
 
     def _get_rewards(self) -> torch.Tensor:
         """踩点、动态步态引导（滞空/离地/距离吸引）、稳定性/平滑正则（含宇树式 hip_pos）；可选奖励课程按 iteration 屏蔽部分项。"""
@@ -907,7 +927,7 @@ class G1PlacingEnv(DirectRLEnv):
                         t = (1.0 - current_dist_to_target_xy / initial_dist_xy).clamp(0.0, 1.0)
                         path_started = torch.ones(num_envs, dtype=torch.bool, device=self.device)
                     base_h = getattr(self.cfg, 'foot_ankle_ground_height', 0.07)
-                    sigma = getattr(self.cfg, 'foot_path_tracking_sigma', 0.025)
+                    sigma = self._foot_path_tracking_sigma_m()
                     aerial_target_path = (target_z > aerial_thresh) & has_target
                     # 统一采用 placing11 的摆线轨迹：xy 线性插值 + z 正弦拱线（空中目标时与目标 z 线性混合）
                     dist_min = getattr(self.cfg, 'foot_target_min_distance', 0.25)
@@ -953,6 +973,11 @@ class G1PlacingEnv(DirectRLEnv):
             action_diff = self.actions - self._prev_actions
             scale_action_rate = getattr(self.cfg, 'rew_scale_action_rate', -0.0001)
             rew_action_rate = scale_action_rate * torch.sum(torch.square(action_diff), dim=1)
+        rew_action_smoothness = torch.zeros(num_envs, device=self.device)
+        if self._prev_actions is not None and self._prev_prev_actions is not None and hasattr(self, 'actions') and (self.actions is not None):
+            action_smoothness_diff = self.actions - 2.0 * self._prev_actions + self._prev_prev_actions
+            scale_action_smoothness = getattr(self.cfg, 'rew_scale_action_smoothness', -1e-4)
+            rew_action_smoothness = scale_action_smoothness * torch.sum(torch.square(action_smoothness_diff), dim=1)
         rew_contact_no_vel = torch.zeros(num_envs, device=self.device)
         if len(feet_body_ids) >= 2:
             fc = self.get_feet_contact_state()
@@ -969,7 +994,7 @@ class G1PlacingEnv(DirectRLEnv):
             q_hip = joint_pos[:, self._hip_pos_joint_ids]
             scale_hip = float(getattr(self.cfg, 'rew_scale_hip_pos', -0.5))
             rew_hip_pos = scale_hip * torch.sum(torch.square(q_hip), dim=1)
-        reward_result = compute_rewards(self.cfg.rew_scale_pitch_roll_angle, self.cfg.rew_scale_height, self.cfg.rew_scale_joint_velocity, self.cfg.rew_scale_joint_acceleration, self.cfg.rew_scale_foot_hit, self.cfg.rew_scale_foot_path_tracking, self.cfg.rew_scale_joint_limit, pitch_angle, roll_angle, joint_vel, joint_acc, foot_hit_reward, foot_path_tracking_reward, joint_limit_violation, height_violation, pitch_roll_swing_multiplier, rew_pitch_roll_ang_vel, rew_action_rate, rew_contact_no_vel, rew_hip_pos)
+        reward_result = compute_rewards(self.cfg.rew_scale_pitch_roll_angle, self.cfg.rew_scale_height, self.cfg.rew_scale_joint_velocity, self.cfg.rew_scale_joint_acceleration, self.cfg.rew_scale_foot_hit, self.cfg.rew_scale_foot_path_tracking, self.cfg.rew_scale_joint_limit, pitch_angle, roll_angle, joint_vel, joint_acc, foot_hit_reward, foot_path_tracking_reward, joint_limit_violation, height_violation, pitch_roll_swing_multiplier, rew_pitch_roll_ang_vel, rew_action_rate, rew_action_smoothness, rew_contact_no_vel, rew_hip_pos)
         (total_reward, rew_pitch_roll_angle, rew_height, rew_joint_velocity, rew_joint_acceleration, rew_foot_hit, rew_foot_path_tracking, rew_joint_limit) = reward_result
         scale_foot_hold = getattr(self.cfg, 'rew_scale_foot_hold', 2.0)
         total_reward = total_reward + scale_foot_hold * rew_foot_hold
@@ -984,7 +1009,7 @@ class G1PlacingEnv(DirectRLEnv):
                 active = self._expand_deprecated_reward_curriculum_components(active)
             active_components = active
             if active:
-                comp = {'rew_pitch_roll_angle': rew_pitch_roll_angle, 'rew_pitch_roll_ang_vel': rew_pitch_roll_ang_vel, 'rew_height': rew_height, 'rew_joint_velocity': rew_joint_velocity, 'rew_joint_acceleration': rew_joint_acceleration, 'rew_foot_hit': rew_foot_hit, 'rew_foot_path_tracking': rew_foot_path_tracking, 'rew_foot_hold': scale_foot_hold * rew_foot_hold, 'rew_joint_limit': rew_joint_limit, 'rew_action_rate': rew_action_rate, 'rew_contact_no_vel': rew_contact_no_vel, 'rew_hip_pos': rew_hip_pos}
+                comp = {'rew_pitch_roll_angle': rew_pitch_roll_angle, 'rew_pitch_roll_ang_vel': rew_pitch_roll_ang_vel, 'rew_height': rew_height, 'rew_joint_velocity': rew_joint_velocity, 'rew_joint_acceleration': rew_joint_acceleration, 'rew_foot_hit': rew_foot_hit, 'rew_foot_path_tracking': rew_foot_path_tracking, 'rew_foot_hold': scale_foot_hold * rew_foot_hold, 'rew_joint_limit': rew_joint_limit, 'rew_action_rate': rew_action_rate, 'rew_action_smoothness': rew_action_smoothness, 'rew_contact_no_vel': rew_contact_no_vel, 'rew_hip_pos': rew_hip_pos}
                 total_reward = sum((comp[n] for n in active if n in comp))
             elif active is not None:
                 total_reward = torch.zeros_like(rew_pitch_roll_angle)
@@ -1005,6 +1030,7 @@ class G1PlacingEnv(DirectRLEnv):
             _add_if_active('rew_foot_hold', scale_foot_hold * rew_foot_hold)
             _add_if_active('rew_joint_limit', rew_joint_limit)
             _add_if_active('rew_action_rate', rew_action_rate)
+            _add_if_active('rew_action_smoothness', rew_action_smoothness)
             _add_if_active('rew_contact_no_vel', rew_contact_no_vel)
             _add_if_active('rew_hip_pos', rew_hip_pos)
         self._check_and_generate_targets()
@@ -1110,11 +1136,18 @@ class G1PlacingEnv(DirectRLEnv):
         else:
             self._prev_joint_vel = joint_vel.clone()
         if self._prev_actions is not None:
+            if self._prev_prev_actions is not None:
+                self._prev_prev_actions[env_ids] = 0.0
+            else:
+                num_envs = self.num_envs
+                num_actions = self.cfg.action_space
+                self._prev_prev_actions = torch.zeros((num_envs, num_actions), device=self.device)
             self._prev_actions[env_ids] = 0.0
         else:
             num_envs = self.num_envs
             num_actions = self.cfg.action_space
             self._prev_actions = torch.zeros((num_envs, num_actions), device=self.device)
+            self._prev_prev_actions = torch.zeros((num_envs, num_actions), device=self.device)
         self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
@@ -1156,7 +1189,7 @@ class G1PlacingEnv(DirectRLEnv):
             self._reschedule_event_push_times_on_reset(env_ids)
 
 @torch.jit.script
-def compute_rewards(rew_scale_pitch_roll_angle: float, rew_scale_height: float, rew_scale_joint_velocity: float, rew_scale_joint_acceleration: float, rew_scale_foot_hit: float, rew_scale_foot_path_tracking: float, rew_scale_joint_limit: float, pitch_angle: torch.Tensor, roll_angle: torch.Tensor, joint_vel: torch.Tensor, joint_acc: torch.Tensor, foot_hit: torch.Tensor, foot_path_tracking_reward: torch.Tensor, joint_limit_violation: torch.Tensor, height_violation: torch.Tensor, pitch_roll_swing_multiplier: torch.Tensor, rew_pitch_roll_ang_vel: torch.Tensor, rew_action_rate: torch.Tensor, rew_contact_no_vel: torch.Tensor, rew_hip_pos: torch.Tensor):
+def compute_rewards(rew_scale_pitch_roll_angle: float, rew_scale_height: float, rew_scale_joint_velocity: float, rew_scale_joint_acceleration: float, rew_scale_foot_hit: float, rew_scale_foot_path_tracking: float, rew_scale_joint_limit: float, pitch_angle: torch.Tensor, roll_angle: torch.Tensor, joint_vel: torch.Tensor, joint_acc: torch.Tensor, foot_hit: torch.Tensor, foot_path_tracking_reward: torch.Tensor, joint_limit_violation: torch.Tensor, height_violation: torch.Tensor, pitch_roll_swing_multiplier: torch.Tensor, rew_pitch_roll_ang_vel: torch.Tensor, rew_action_rate: torch.Tensor, rew_action_smoothness: torch.Tensor, rew_contact_no_vel: torch.Tensor, rew_hip_pos: torch.Tensor):
     rew_height = rew_scale_height * height_violation
     pitch_roll_angle_penalty = torch.square(pitch_angle) + torch.square(roll_angle)
     joint_acceleration_penalty = torch.sum(torch.square(joint_acc), dim=1)
@@ -1166,5 +1199,5 @@ def compute_rewards(rew_scale_pitch_roll_angle: float, rew_scale_height: float, 
     rew_foot_hit = rew_scale_foot_hit * foot_hit
     rew_foot_path_tracking = rew_scale_foot_path_tracking * foot_path_tracking_reward
     rew_joint_limit = rew_scale_joint_limit * joint_limit_violation
-    total_reward = rew_height + rew_pitch_roll_angle + rew_pitch_roll_ang_vel + rew_joint_velocity + rew_joint_acceleration + rew_foot_hit + rew_foot_path_tracking + rew_joint_limit + rew_action_rate + rew_contact_no_vel + rew_hip_pos
+    total_reward = rew_height + rew_pitch_roll_angle + rew_pitch_roll_ang_vel + rew_joint_velocity + rew_joint_acceleration + rew_foot_hit + rew_foot_path_tracking + rew_joint_limit + rew_action_rate + rew_action_smoothness + rew_contact_no_vel + rew_hip_pos
     return (total_reward, rew_pitch_roll_angle, rew_height, rew_joint_velocity, rew_joint_acceleration, rew_foot_hit, rew_foot_path_tracking, rew_joint_limit)
