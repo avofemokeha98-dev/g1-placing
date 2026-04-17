@@ -38,9 +38,11 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     action_rate_limit_rad_per_step = 0.05
     torso_joint_limit_rad = 0.35
     soft_dof_pos_limit = 0.9
-    rew_scale_pitch_roll_angle = -0.5
+    # 史诗级加强！严禁下腰和弯腰，逼迫它必须靠移动底盘去靠近目标
+    rew_scale_pitch_roll_angle = -5.0
     rew_scale_pitch_roll_ang_vel = -0.001
-    rew_scale_pitch_roll_swing_extra = 0.5
+    # 摆动腿在空中时，单腿支撑极易摔倒，此时姿态惩罚翻倍！(1.0 + 1.0 = 2倍惩罚)
+    rew_scale_pitch_roll_swing_extra = 1.0
     rew_scale_height = -5.0
     height_target = 0.74
     height_penalty_band = 0.05
@@ -92,7 +94,8 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     foot_target_hit_z_max = 0.09
     foot_target_hit_min_elapsed_s = 0.05
     foot_target_regenerate_delay_s = 0.5
-    foot_target_rect_x_forward = 0.3
+    # 从 0.30 稍微收缩到 0.25，等学会重心前移连续走路后再改回 0.3 亦可
+    foot_target_rect_x_forward = 0.25
     foot_target_rect_x_back = 0.12
     foot_target_rect_y_outward = 0.15
     foot_target_rect_y_inward = 0.02
