@@ -334,7 +334,6 @@ class G1PlacingEnv(DirectRLEnv):
         base_h = float(getattr(self.cfg, 'foot_ankle_ground_height', 0.07))
         aerial_thresh = float(getattr(self.cfg, 'foot_target_aerial_ground_threshold', 0.075))
         target_z = target[2]
-        end_z = target_z if target_z > aerial_thresh else torch.tensor(base_h, device=self.device, dtype=target.dtype)
         dist_xy = torch.norm(target[:2] - start[:2]).clamp(min=1e-4)
         dist_min = float(getattr(self.cfg, 'foot_target_min_distance', 0.25))
         dist_max = float(getattr(self.cfg, 'foot_target_max_distance', 0.40))
@@ -344,10 +343,22 @@ class G1PlacingEnv(DirectRLEnv):
         peak_h = peak_min + (peak_max - peak_min) * dist_ratio
         n_pts = 21
         t = torch.linspace(0.0, 1.0, n_pts, device=self.device, dtype=target.dtype)
-        ref_xy = (1.0 - t).unsqueeze(1) * start[:2].unsqueeze(0) + t.unsqueeze(1) * target[:2].unsqueeze(0)
-        ref_z_ground = (base_h + (peak_h - base_h) * torch.sin(t * np.pi)).unsqueeze(1)
+        # XY 五次多项式
+        t_xy = 10 * t**3 - 15 * t**4 + 6 * t**5
+        ref_xy = (1.0 - t_xy).unsqueeze(1) * start[:2].unsqueeze(0) + t_xy.unsqueeze(1) * target[:2].unsqueeze(0)
+
+        # Z 三次贝塞尔 (仅用于地面到地面连线可视化)
+        p0_z = torch.full((n_pts, 1), base_h, device=self.device, dtype=target.dtype)
+        p3_z = torch.full((n_pts, 1), base_h, device=self.device, dtype=target.dtype)
+        pull_factor = 1.6
+        p1_z = p0_z + (peak_h - base_h) * pull_factor
+        p2_z = p3_z + (peak_h - base_h) * pull_factor
+
+        t_z = t.unsqueeze(1)
+        inv_t = 1.0 - t_z
+        ref_z_ground = (inv_t**3) * p0_z + 3 * (inv_t**2) * t_z * p1_z + 3 * inv_t * (t_z**2) * p2_z + (t_z**3) * p3_z
         if target_z > aerial_thresh:
-            ref_z = ref_z_ground * (1.0 - t).unsqueeze(1) + end_z * t.unsqueeze(1)
+            ref_z = ref_z_ground * (1.0 - t_z) + target_z.unsqueeze(0).unsqueeze(1) * t_z
         else:
             ref_z = ref_z_ground
         pts = torch.cat([ref_xy, ref_z], dim=1)
@@ -865,17 +876,24 @@ class G1PlacingEnv(DirectRLEnv):
                 foot_hit_reward = torch.where(reward_frame, hit_reward_base, torch.zeros_like(hit_reward_base))
                 if self._foot_land_rewarded is not None:
                     self._foot_land_rewarded = self._foot_land_rewarded | landing_evidence
-                delay_s = float(getattr(self.cfg, 'foot_target_regenerate_delay_s', 0.5))
+                # =====================================================================
+                # 核心优化：动态跟步延迟 (Dynamic Follow-up Delay)
+                # =====================================================================
+                delay_base = float(getattr(self.cfg, 'foot_target_regenerate_delay_s', 0.5))
+
+                # 如果下一步是跟步(is_next_follow为True)，给一个极短的0.05s缓冲让物理引擎结算，然后立刻出脚；
+                # 如果双腿已经合拢，准备迈出全新的随机步，则正常停顿 delay_base 秒
+                is_next_follow = self._next_is_follow if hasattr(self, '_next_is_follow') else torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+                delay_tensor = torch.where(is_next_follow, torch.tensor(0.05, device=self.device), torch.tensor(delay_base, device=self.device))
+
                 skip_tm = self._user_target_mode if self._user_target_mode is not None else torch.zeros(num_envs, dtype=torch.bool, device=self.device)
                 user_hit = hit_target & skip_tm
                 auto_hit = hit_target & ~skip_tm
-                if delay_s > 0.0:
-                    self._target_hit = self._target_hit | user_hit
-                    if self._target_regenerate_deadline is not None:
-                        sched = auto_hit & torch.isnan(self._target_regenerate_deadline)
-                        self._target_regenerate_deadline = torch.where(sched, current_time + delay_s, self._target_regenerate_deadline)
-                else:
-                    self._target_hit = self._target_hit | hit_target
+
+                self._target_hit = self._target_hit | user_hit
+                if self._target_regenerate_deadline is not None:
+                    sched = auto_hit & torch.isnan(self._target_regenerate_deadline)
+                    self._target_regenerate_deadline = torch.where(sched, current_time + delay_tensor, self._target_regenerate_deadline)
                 if self._last_touchdown_time is not None:
                     self._last_touchdown_time = torch.where(landing_evidence, current_time, self._last_touchdown_time)
                 aerial_thresh = getattr(self.cfg, 'foot_target_aerial_ground_threshold', 0.075)
@@ -929,16 +947,40 @@ class G1PlacingEnv(DirectRLEnv):
                     base_h = getattr(self.cfg, 'foot_ankle_ground_height', 0.07)
                     sigma = self._foot_path_tracking_sigma_m()
                     aerial_target_path = (target_z > aerial_thresh) & has_target
-                    # 统一采用 placing11 的摆线轨迹：xy 线性插值 + z 正弦拱线（空中目标时与目标 z 线性混合）
+                    # ==========================================================
+                    # 终极仿生轨迹生成器 (Quintic XY + Bezier Z)
+                    # ==========================================================
                     dist_min = getattr(self.cfg, 'foot_target_min_distance', 0.25)
                     dist_max = getattr(self.cfg, 'foot_target_max_distance', 0.40)
                     peak_min = getattr(self.cfg, 'foot_path_peak_height_min', 0.10)
                     peak_max = getattr(self.cfg, 'foot_path_peak_height_max', 0.15)
                     dist_ratio = ((initial_dist_xy - dist_min) / (dist_max - dist_min + 1e-06)).clamp(0.0, 1.0)
                     peak_h = peak_min + (peak_max - peak_min) * dist_ratio
-                    ref_xy = (1 - t).unsqueeze(1) * start_xy + t.unsqueeze(1) * end_xy
-                    ref_z_ground = (base_h + (peak_h - base_h) * torch.sin(t * 3.14159265)).unsqueeze(1)
-                    ref_z = torch.where(aerial_target_path.unsqueeze(1), ref_z_ground * (1 - t).unsqueeze(1) + target_z.unsqueeze(1) * t.unsqueeze(1), ref_z_ground)
+
+                    # 1. XY 轴：五次多项式插值 (Quintic Spline)
+                    # 公式：s(t) = 10t^3 - 15t^4 + 6t^5
+                    # 效果：t=0 和 t=1 时，一阶导(速度)和二阶导(加速度)均为 0，极度平滑
+                    t_xy = 10 * t**3 - 15 * t**4 + 6 * t**5
+                    ref_xy = (1 - t_xy).unsqueeze(1) * start_xy + t_xy.unsqueeze(1) * end_xy
+
+                    # 2. Z 轴：三次贝塞尔曲线 (Cubic Bezier)
+                    # 公式：P(t) = (1-t)^3*P0 + 3*(1-t)^2*t*P1 + 3*(1-t)*t^2*P2 + t^3*P3
+                    p0_z = torch.full((num_envs, 1), base_h, device=self.device)
+                    # 终点 P3_z：区分地面点和空中目标点
+                    p3_z = torch.where(aerial_target_path.unsqueeze(1), target_z.unsqueeze(1), p0_z)
+
+                    # 核心魔法：控制点 P1 和 P2
+                    # 将它们上拉，形成类似人类跨栏时的“倒 U 型 / 平顶抛物线”
+                    pull_factor = 1.6
+                    p1_z = p0_z + (peak_h - base_h).unsqueeze(1) * pull_factor
+                    p2_z = p3_z + (peak_h - base_h).unsqueeze(1) * pull_factor
+
+                    # 贝塞尔计算
+                    t_z = t.unsqueeze(1)
+                    inv_t = 1.0 - t_z
+                    ref_z = (inv_t**3) * p0_z + 3 * (inv_t**2) * t_z * p1_z + 3 * inv_t * (t_z**2) * p2_z + (t_z**3) * p3_z
+
+                    # 组合成最终的 3D 参考坐标
                     ref_pos = torch.cat([ref_xy, ref_z], dim=1)
                     dist_to_ref = torch.norm(swing_foot_pos - ref_pos, dim=1)
                     raw_reward = torch.exp(-0.5 * torch.square(dist_to_ref / sigma))
