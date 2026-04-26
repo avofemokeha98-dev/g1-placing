@@ -3,7 +3,7 @@ from isaaclab_assets.robots.unitree import G1_CFG
 from isaaclab.assets import ArticulationCfg
 from isaaclab.utils import configclass
 _UNITREE_PD_LEGS = G1_CFG.actuators['legs'].replace(stiffness={'.*_hip_yaw_joint': 100.0, '.*_hip_roll_joint': 100.0, '.*_hip_pitch_joint': 100.0, '.*_knee_joint': 150.0, 'torso_joint': 150.0}, damping={'.*_hip_yaw_joint': 2.0, '.*_hip_roll_joint': 2.0, '.*_hip_pitch_joint': 2.0, '.*_knee_joint': 4.0, 'torso_joint': 4.0})
-_HOST_PD_FEET = G1_CFG.actuators['feet'].replace(stiffness=40.0, damping=20.0)
+_HOST_PD_FEET = G1_CFG.actuators['feet'].replace(stiffness=40.0, damping=2.0)
 _HOST_PD_ARMS = G1_CFG.actuators['arms'].replace(stiffness=100.0, damping=20.0)
 _HOST_PD_ACTUATORS = {'legs': _UNITREE_PD_LEGS, 'feet': _HOST_PD_FEET, 'arms': _HOST_PD_ARMS}
 import isaaclab.sim as sim_utils
