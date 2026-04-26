@@ -854,19 +854,20 @@ class G1PlacingEnv(DirectRLEnv):
                 d_z_err = torch.abs(swing_foot_z - expected_ankle_z)
                 z_tolerance = float(getattr(self.cfg, 'foot_target_hit_z_tolerance', 0.04))
                 z_contact_slack = float(getattr(self.cfg, 'foot_target_hit_z_contact_slack', 0.02))
-                z_max = float(getattr(self.cfg, 'foot_target_hit_z_max', 0.09))
                 thresh_xy = self._foot_hit_curriculum_radius_xy_m()
                 xy_ok = d_xy < thresh_xy
                 z_ok_contact = swing_foot_contact & (swing_foot_z <= target_z_ground + ankle_ground_h + z_contact_slack) if swing_foot_contact is not None else torch.zeros(num_envs, dtype=torch.bool, device=self.device)
                 z_ok = (d_z_err < z_tolerance) | z_ok_contact
                 geometry_ok = xy_ok & z_ok
-                target_elapsed = (self.episode_length_buf.float() * self.step_dt - self._target_generation_time).clamp(min=0.0)
-                min_elapsed = getattr(self.cfg, 'foot_target_hit_min_elapsed_s', 0.05)
-                touchdown_with_target = touchdown_event & has_target if swing_foot_contact is not None else torch.zeros(num_envs, dtype=torch.bool, device=self.device)
-                fallback_contact = has_target & xy_ok & swing_foot_contact & self._swing_foot_lifted & ~self._foot_land_rewarded if swing_foot_contact is not None else torch.zeros(num_envs, dtype=torch.bool, device=self.device)
-                height_fallback = has_target & xy_ok & (swing_foot_z < target_z_ground + z_max) & ~self._foot_land_rewarded & (target_elapsed >= min_elapsed)
-                landing_evidence = touchdown_with_target | fallback_contact | height_fallback
-                hit_target = has_target & geometry_ok & landing_evidence
+                # ==========================================================
+                # 终极物理判定 (Industry Standard Contact Check)
+                # ==========================================================
+                # 1. 物理引擎是否真实感受到了大于 1.0N 的触地反作用力？
+                is_contact_active = swing_foot_contact if swing_foot_contact is not None else torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+                # 2. 合法落地证据：必须有真实物理碰撞 + 之前有抬腿动作（防拖把滑步） + 当前步未结算过奖励
+                landing_evidence = has_target & is_contact_active & self._swing_foot_lifted & ~self._foot_land_rewarded
+                # 3. 完美踩点：合法落地 + 几何误差(XY和Z)达标
+                hit_target = landing_evidence & geometry_ok
                 current_time = self.episode_length_buf.float() * self.step_dt
                 d_eff = torch.sqrt(torch.square(d_xy / max(thresh_xy, 1e-06)) + torch.square(d_z_err / max(ankle_ground_h, 1e-06))).clamp(min=1e-06)
                 sigma_hit = getattr(self.cfg, 'foot_hit_sigma', 0.03)
