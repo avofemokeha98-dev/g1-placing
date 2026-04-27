@@ -81,7 +81,7 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     com_over_support_sigma = 0.03
     penetration_threshold = 0.02
     foot_contact_use_physics_sensor: bool = True
-    foot_contact_touchdown_force: float = 80.0
+    foot_contact_touchdown_force: float = 50.0
     foot_contact_liftoff_force: float = 20.0
     foot_contact_height_threshold = 0.075
     foot_contact_consecutive_frames = 2
@@ -90,8 +90,8 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     foot_target_hit_threshold_end = 0.03
     foot_target_hit_threshold_iter_start = 3000
     foot_target_hit_threshold_iter_end = 8000
-    foot_target_hit_z_tolerance = 0.04
-    foot_target_hit_z_contact_slack = 0.02
+    foot_target_hit_z_tolerance = 0.05
+    foot_target_hit_z_contact_slack = 0.05
     foot_target_hit_z_max = 0.09
     foot_target_hit_min_elapsed_s = 0.05
     foot_target_regenerate_delay_s = 0.5
