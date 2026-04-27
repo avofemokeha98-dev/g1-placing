@@ -209,9 +209,24 @@ class G1PlacingEnv(DirectRLEnv):
             if self._foot_contact_body_sensor_indices is not None:
                 idx = self._foot_contact_body_sensor_indices
                 forces = self._foot_contact_sensor.data.net_forces_w[:, idx, :]
-                fn = torch.norm(forces, dim=-1)
-                th = float(getattr(self.cfg, 'foot_contact_force_threshold', 1.0))
-                self._feet_contact_cache = fn > th
+
+                # 1. 核心修复：只取 Z 轴法向力，加绝对值防止穿模拉扯报错
+                fn_z = torch.abs(forces[..., 2])
+
+                # 2. 读取双阈值
+                th_touchdown = float(getattr(self.cfg, 'foot_contact_touchdown_force', 80.0))
+                th_liftoff = float(getattr(self.cfg, 'foot_contact_liftoff_force', 20.0))
+
+                # 3. 施密特触发器 (迟滞滤波)逻辑
+                was_contact = self._persistent_feet_contact
+                is_contact = torch.where(
+                    was_contact,
+                    fn_z >= th_liftoff,   # 如果本来在地上，力要小于20N才算离地
+                    fn_z >= th_touchdown  # 如果本来在空中，力要大于80N才算踩实
+                )
+
+                self._persistent_feet_contact = is_contact
+                self._feet_contact_cache = is_contact
                 return self._feet_contact_cache
         if self._ankle_contact_consecutive_count is None:
             return None
@@ -264,6 +279,7 @@ class G1PlacingEnv(DirectRLEnv):
         self._foot_land_rewarded = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         self._ankle_contact_consecutive_count = torch.zeros((num_envs, 2), dtype=torch.long, device=self.device)
         self._feet_contact_cache = None
+        self._persistent_feet_contact = torch.zeros((num_envs, 2), dtype=torch.bool, device=self.device)
         target_marker_cfg = VisualizationMarkersCfg(prim_path='/Visuals/foot_target_markers', markers={'target': sim_utils.SphereCfg(radius=0.03, visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 1.0, 0.0)))})
         self._target_markers = VisualizationMarkers(target_marker_cfg)
         self._target_markers.set_visibility(True)
@@ -1139,6 +1155,9 @@ class G1PlacingEnv(DirectRLEnv):
             for name in self._reward_components:
                 self._episode_reward_sums[name][env_ids_tensor] = 0.0
         super()._reset_idx(env_ids)
+        if hasattr(self, '_persistent_feet_contact'):
+            env_ids_t = env_ids if isinstance(env_ids, torch.Tensor) else torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+            self._persistent_feet_contact[env_ids_t] = False
         if self._ankle_contact_consecutive_count is not None and len(env_ids) > 0:
             env_ids_t = env_ids if isinstance(env_ids, torch.Tensor) else torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
             self._ankle_contact_consecutive_count[env_ids_t] = 0
