@@ -45,7 +45,7 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     rew_scale_pitch_roll_swing_extra = 1.0
     rew_scale_height = -5.0
     height_target = 0.74
-    height_penalty_band = 0.05
+    height_penalty_band = 0.10
     rew_scale_joint_velocity = -0.001
     rew_scale_joint_acceleration = -1e-07
     rew_scale_action_rate = -0.001
