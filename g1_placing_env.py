@@ -861,7 +861,7 @@ class G1PlacingEnv(DirectRLEnv):
                 # ==========================================================
                 # 终极物理判定 (Industry Standard Contact Check)
                 # ==========================================================
-                # 1. 物理引擎是否真实感受到了大于 1.0N 的触地反作用力？
+                # 1. 物理引擎是否真实感受到了大于 80N 的触地反作用力？
                 is_contact_active = swing_foot_contact if swing_foot_contact is not None else torch.zeros(num_envs, dtype=torch.bool, device=self.device)
                 # 2. 合法落地证据：必须有真实物理碰撞 + 之前有抬腿动作（防拖把滑步） + 当前步未结算过奖励
                 landing_evidence = has_target & is_contact_active & self._swing_foot_lifted & ~self._foot_land_rewarded

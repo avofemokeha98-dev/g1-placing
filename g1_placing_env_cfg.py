@@ -81,7 +81,7 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     com_over_support_sigma = 0.03
     penetration_threshold = 0.02
     foot_contact_use_physics_sensor: bool = True
-    foot_contact_force_threshold: float = 1.0
+    foot_contact_force_threshold: float = 80.0
     foot_contact_height_threshold = 0.075
     foot_contact_consecutive_frames = 2
     foot_contact_velocity_threshold = 0.08
