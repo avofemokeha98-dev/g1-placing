@@ -60,7 +60,7 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     foot_hit_sigma = 0.03
     foot_ankle_ground_height = 0.07
     foot_path_peak_height_min = 0.10
-    foot_path_peak_height_max = 0.14
+    foot_path_peak_height_max = 0.10
     foot_path_tracking_sigma = 0.025
     foot_path_tracking_sigma_start = 0.075
     foot_path_tracking_sigma_end = 0.025
@@ -95,13 +95,13 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     foot_target_hit_z_max = 0.09
     foot_target_hit_min_elapsed_s = 0.05
     foot_target_regenerate_delay_s = 0.5
-    # 从 0.30 稍微收缩到 0.25，等学会重心前移连续走路后再改回 0.3 亦可
-    foot_target_rect_x_forward = 0.25
-    foot_target_rect_x_back = 0.12
+    # 小碎步：前向探测距离缩短，后退一并收缩，限制最大采样跨步
+    foot_target_rect_x_forward = 0.12
+    foot_target_rect_x_back = 0.05
     foot_target_rect_y_outward = 0.15
     foot_target_rect_y_inward = 0.02
     foot_target_min_distance = 0.1
-    foot_target_max_distance = 0.25
+    foot_target_max_distance = 0.15
     foot_spacing_stand_m = 0.24
     reset_root_height = 0.74
     reward_curriculum_mode = 'iteration'
