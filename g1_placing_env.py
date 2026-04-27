@@ -279,7 +279,7 @@ class G1PlacingEnv(DirectRLEnv):
         )
         self._path_line_markers = VisualizationMarkers(path_line_cfg)
         self._path_line_markers.set_visibility(True)
-        self._reward_components = ['rew_pitch_roll_angle', 'rew_pitch_roll_ang_vel', 'rew_height', 'rew_joint_velocity', 'rew_joint_acceleration', 'rew_foot_hit', 'rew_foot_path_tracking', 'rew_foot_hold', 'rew_joint_limit', 'rew_action_rate', 'rew_action_smoothness', 'rew_contact_no_vel', 'rew_hip_pos']
+        self._reward_components = ['rew_pitch_roll_angle', 'rew_pitch_roll_ang_vel', 'rew_height', 'rew_joint_velocity', 'rew_joint_acceleration', 'rew_foot_hit', 'rew_foot_path_tracking', 'rew_joint_limit', 'rew_action_rate', 'rew_action_smoothness', 'rew_contact_no_vel', 'rew_hip_pos']
         self._episode_reward_sums = {name: torch.zeros(num_envs, dtype=torch.float32, device=self.device) for name in self._reward_components}
         self._last_episode_reward_means = {name: 0.0 for name in self._reward_components}
 
@@ -802,7 +802,6 @@ class G1PlacingEnv(DirectRLEnv):
         num_envs = joint_pos.shape[0]
         self._check_and_generate_targets()
         foot_path_tracking_reward = torch.zeros(num_envs, device=self.device)
-        rew_foot_hold = torch.zeros(num_envs, device=self.device)
         is_swing_foot_in_air = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         env_indices = torch.arange(num_envs, device=self.device)
         touchdown_event = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
@@ -913,15 +912,6 @@ class G1PlacingEnv(DirectRLEnv):
                 aerial_hold_done = aerial_target & (self._aerial_hold_start_time > -1000000000.0) & (current_time - self._aerial_hold_start_time >= hold_duration) if self._aerial_hold_start_time is not None else torch.zeros_like(hit_target)
                 hit_target = hit_target | aerial_hold_done
                 in_hold = aerial_target & (self._aerial_hold_start_time > -1000000000.0) & (current_time - self._aerial_hold_start_time < hold_duration) & is_swing_foot_in_air if self._aerial_hold_start_time is not None else torch.zeros_like(hit_target)
-                if torch.any(in_hold):
-                    foot_hold_sigma = getattr(self.cfg, 'foot_hold_sigma', 0.04)
-                    dist_foot_to_target = torch.norm(swing_foot_pos - self._foot_target_positions, dim=1)
-                    swing_vel_w = self.robot.data.body_lin_vel_w[env_indices, self._target_foot_indices, :]
-                    swing_speed = torch.norm(swing_vel_w, dim=1)
-                    rew_vel_stop = torch.exp(-swing_speed / 0.15)
-                    rew_foot_hold_raw = torch.exp(-0.5 * torch.square(dist_foot_to_target / foot_hold_sigma))
-                    rew_foot_hold_raw = rew_foot_hold_raw * (0.3 + 0.7 * rew_vel_stop)
-                    rew_foot_hold = torch.where(in_hold, rew_foot_hold_raw, rew_foot_hold)
                 if self._swing_foot_path_start is not None:
                     start_xy = self._swing_foot_path_start[:, :2]
                     end_xy = self._foot_target_positions[:, :2]
@@ -1039,8 +1029,6 @@ class G1PlacingEnv(DirectRLEnv):
             rew_hip_pos = scale_hip * torch.sum(torch.square(q_hip), dim=1)
         reward_result = compute_rewards(self.cfg.rew_scale_pitch_roll_angle, self.cfg.rew_scale_height, self.cfg.rew_scale_joint_velocity, self.cfg.rew_scale_joint_acceleration, self.cfg.rew_scale_foot_hit, self.cfg.rew_scale_foot_path_tracking, self.cfg.rew_scale_joint_limit, pitch_angle, roll_angle, joint_vel, joint_acc, foot_hit_reward, foot_path_tracking_reward, joint_limit_violation, height_violation, pitch_roll_swing_multiplier, rew_pitch_roll_ang_vel, rew_action_rate, rew_action_smoothness, rew_contact_no_vel, rew_hip_pos)
         (total_reward, rew_pitch_roll_angle, rew_height, rew_joint_velocity, rew_joint_acceleration, rew_foot_hit, rew_foot_path_tracking, rew_joint_limit) = reward_result
-        scale_foot_hold = getattr(self.cfg, 'rew_scale_foot_hold', 2.0)
-        total_reward = total_reward + scale_foot_hold * rew_foot_hold
         curriculum = getattr(self.cfg, 'reward_curriculum', None)
         active_components = None
         if curriculum and len(curriculum) > 0:
@@ -1052,7 +1040,7 @@ class G1PlacingEnv(DirectRLEnv):
                 active = self._expand_deprecated_reward_curriculum_components(active)
             active_components = active
             if active:
-                comp = {'rew_pitch_roll_angle': rew_pitch_roll_angle, 'rew_pitch_roll_ang_vel': rew_pitch_roll_ang_vel, 'rew_height': rew_height, 'rew_joint_velocity': rew_joint_velocity, 'rew_joint_acceleration': rew_joint_acceleration, 'rew_foot_hit': rew_foot_hit, 'rew_foot_path_tracking': rew_foot_path_tracking, 'rew_foot_hold': scale_foot_hold * rew_foot_hold, 'rew_joint_limit': rew_joint_limit, 'rew_action_rate': rew_action_rate, 'rew_action_smoothness': rew_action_smoothness, 'rew_contact_no_vel': rew_contact_no_vel, 'rew_hip_pos': rew_hip_pos}
+                comp = {'rew_pitch_roll_angle': rew_pitch_roll_angle, 'rew_pitch_roll_ang_vel': rew_pitch_roll_ang_vel, 'rew_height': rew_height, 'rew_joint_velocity': rew_joint_velocity, 'rew_joint_acceleration': rew_joint_acceleration, 'rew_foot_hit': rew_foot_hit, 'rew_foot_path_tracking': rew_foot_path_tracking, 'rew_joint_limit': rew_joint_limit, 'rew_action_rate': rew_action_rate, 'rew_action_smoothness': rew_action_smoothness, 'rew_contact_no_vel': rew_contact_no_vel, 'rew_hip_pos': rew_hip_pos}
                 total_reward = sum((comp[n] for n in active if n in comp))
             elif active is not None:
                 total_reward = torch.zeros_like(rew_pitch_roll_angle)
@@ -1070,7 +1058,6 @@ class G1PlacingEnv(DirectRLEnv):
             _add_if_active('rew_joint_acceleration', rew_joint_acceleration)
             _add_if_active('rew_foot_hit', rew_foot_hit)
             _add_if_active('rew_foot_path_tracking', rew_foot_path_tracking)
-            _add_if_active('rew_foot_hold', scale_foot_hold * rew_foot_hold)
             _add_if_active('rew_joint_limit', rew_joint_limit)
             _add_if_active('rew_action_rate', rew_action_rate)
             _add_if_active('rew_action_smoothness', rew_action_smoothness)
