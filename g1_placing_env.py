@@ -875,23 +875,29 @@ class G1PlacingEnv(DirectRLEnv):
                 z_ok = (d_z_err < z_tolerance) | z_ok_contact
                 geometry_ok = xy_ok & z_ok
                 # ==========================================================
-                # 终极物理判定 (Industry Standard Contact Check)
+                # 终极物理判定 (修复版)
                 # ==========================================================
-                # 1. 物理引擎是否真实感受到了大于 80N 的触地反作用力？
+                # 1. 物理引擎是否真实感受到了触地反作用力
                 is_contact_active = swing_foot_contact if swing_foot_contact is not None else torch.zeros(num_envs, dtype=torch.bool, device=self.device)
-                # 2. 合法落地证据：必须有真实物理碰撞 + 之前有抬腿动作（防拖把滑步） + 当前步未结算过奖励
-                landing_evidence = has_target & is_contact_active & self._swing_foot_lifted & ~self._foot_land_rewarded
-                # 3. 完美踩点：合法落地 + 几何误差(XY和Z)达标
-                hit_target = landing_evidence & geometry_ok
-                current_time = self.episode_length_buf.float() * self.step_dt
+
+                # 2. 基本落地证据：有物理碰撞 + 之前抬过腿（防滑步）
+                # 注意：这里不再包含 ~self._foot_land_rewarded，防止提前误锁
+                landing_valid = has_target & is_contact_active & self._swing_foot_lifted
+
+                # 3. 核心判定：落地合法 + 几何位置精确 (XY和Z都对)
+                hit_target = landing_valid & geometry_ok
                 d_eff = torch.sqrt(torch.square(d_xy / max(thresh_xy, 1e-06)) + torch.square(d_z_err / max(ankle_ground_h, 1e-06))).clamp(min=1e-06)
                 sigma_hit = getattr(self.cfg, 'foot_hit_sigma', 0.03)
                 sigma_eff = sigma_hit / max(thresh_xy, 1e-06)
                 hit_reward_base = torch.exp(-0.5 * torch.square(d_eff / sigma_eff))
-                reward_frame = landing_evidence & geometry_ok
+
+                # 4. 奖励分发：只有真的中了 && 这一步还没领过，才发奖
+                reward_frame = hit_target & ~self._foot_land_rewarded
                 foot_hit_reward = torch.where(reward_frame, hit_reward_base, torch.zeros_like(hit_reward_base))
+
+                # 5. 状态锁定：只有在 hit_target 为 True 时才标记 rewarded，防止在路边碰一下地就失效
                 if self._foot_land_rewarded is not None:
-                    self._foot_land_rewarded = self._foot_land_rewarded | landing_evidence
+                    self._foot_land_rewarded = self._foot_land_rewarded | hit_target
                 # =====================================================================
                 # 核心优化：动态跟步延迟 (Dynamic Follow-up Delay)
                 # =====================================================================
@@ -901,17 +907,21 @@ class G1PlacingEnv(DirectRLEnv):
                 # 如果双腿已经合拢，准备迈出全新的随机步，则正常停顿 delay_base 秒
                 is_next_follow = self._next_is_follow if hasattr(self, '_next_is_follow') else torch.zeros(num_envs, dtype=torch.bool, device=self.device)
                 delay_tensor = torch.where(is_next_follow, torch.tensor(0.05, device=self.device), torch.tensor(delay_base, device=self.device))
-
                 skip_tm = self._user_target_mode if self._user_target_mode is not None else torch.zeros(num_envs, dtype=torch.bool, device=self.device)
-                user_hit = hit_target & skip_tm
-                auto_hit = hit_target & ~skip_tm
-
-                self._target_hit = self._target_hit | user_hit
+                # 6. 统一更新 self._target_hit，确保 _check_and_generate_targets 能感知到
+                # 无论用户模式还是自动模式，只要中了就置 True
+                self._target_hit = self._target_hit | hit_target
+                # ==========================================================
+                # 刷新计时逻辑
+                # ==========================================================
+                current_time = self.episode_length_buf.float() * self.step_dt
                 if self._target_regenerate_deadline is not None:
-                    sched = auto_hit & torch.isnan(self._target_regenerate_deadline)
-                    self._target_regenerate_deadline = torch.where(sched, current_time + delay_tensor, self._target_regenerate_deadline)
+                    # 如果是自动模式，且刚踩中且没排期，就排期刷新
+                    auto_hit = hit_target & ~skip_tm
+                    sched_ready = auto_hit & torch.isnan(self._target_regenerate_deadline)
+                    self._target_regenerate_deadline = torch.where(sched_ready, current_time + delay_tensor, self._target_regenerate_deadline)
                 if self._last_touchdown_time is not None:
-                    self._last_touchdown_time = torch.where(landing_evidence, current_time, self._last_touchdown_time)
+                    self._last_touchdown_time = torch.where(hit_target, current_time, self._last_touchdown_time)
                 aerial_thresh = getattr(self.cfg, 'foot_target_aerial_ground_threshold', 0.075)
                 target_z = self._foot_target_positions[:, 2]
                 aerial_target = (target_z > aerial_thresh) & has_target
