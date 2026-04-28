@@ -24,7 +24,6 @@ from isaaclab.utils.math import quat_from_euler_xyz
 import isaaclab.sim as sim_utils
 
 from .g1_placing_env_cfg import _HOST_PD_ACTUATORS
-from .hex_prism_mesh import MeshHexPrismCfg
 
 # 与 g1_placing_env_cfg（灵巧手 g1.usd）对齐
 G1_DEXTEROUS_NUM_JOINTS = 37
@@ -177,7 +176,8 @@ class G1PlacingMarlEnvCfg(DirectMARLEnvCfg):
 
     hex_plank_cfg: RigidObjectCfg = RigidObjectCfg(
         prim_path="/World/envs/env_.*/HexPlank",
-        spawn=MeshHexPrismCfg(
+        # 使用内置圆柱体逼近原六边形板（避免外部自定义 mesh 依赖）
+        spawn=sim_utils.CylinderCfg(
             radius=0.52,
             height=0.03,
             rigid_props=RigidBodyPropertiesCfg(),
