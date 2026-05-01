@@ -16,6 +16,7 @@ from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, quat_apply_yaw,
 from .g1_placing_env_cfg import G1PlacingEnvCfg
 from .placing_joint_lock import apply_locked_joint_targets, collect_locked_joint_ids
 from .placing_joint_limits import reward_joint_limit_interval
+from .placing_reference_path import quarter_circle_radius_from_arc_length, reference_path_polyline_world, reference_path_velocity_world
 
 class G1PlacingEnv(DirectRLEnv):
     cfg: G1PlacingEnvCfg
@@ -62,8 +63,10 @@ class G1PlacingEnv(DirectRLEnv):
         self._prev_joint_pos_target: torch.Tensor | None = None
         self._event_next_push_at: torch.Tensor | None = None
         self._event_mass_asset_cfg: SceneEntityCfg | None = None
+        self._ref_path_static_visual_spawned = False
         if getattr(cfg, 'event_curriculum_enabled', False):
             self._event_next_push_at = torch.zeros(self.num_envs, device=self.device)
+        self._ensure_static_ref_path_visual()
 
     def _get_event_curriculum_phase(self) -> dict | None:
         if not getattr(self.cfg, 'event_curriculum_enabled', False):
@@ -150,8 +153,8 @@ class G1PlacingEnv(DirectRLEnv):
         (self.reset_terminated[:], self.reset_time_outs[:]) = self._get_dones()
         self.reset_buf = self.reset_terminated | self.reset_time_outs
         self.reward_buf = self._get_rewards()
-        reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
-        if len(reset_env_ids) > 0:
+        reset_env_ids = self.reset_buf.nonzero(as_tuple=False).view(-1)
+        if reset_env_ids.numel() > 0:
             self._reset_idx(reset_env_ids)
             self.scene.write_data_to_sim()
             self.sim.forward()
@@ -165,6 +168,7 @@ class G1PlacingEnv(DirectRLEnv):
         self.obs_buf = self._get_observations()
         if self.cfg.observation_noise_model:
             self.obs_buf['policy'] = self._observation_noise_model.apply(self.obs_buf['policy'])
+        self._advance_reference_path_progress(reset_env_ids)
         return (self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras)
 
     def _get_feet_body_ids(self) -> list:
@@ -295,9 +299,38 @@ class G1PlacingEnv(DirectRLEnv):
         )
         self._path_line_markers = VisualizationMarkers(path_line_cfg)
         self._path_line_markers.set_visibility(True)
+        ref_r = float(getattr(self.cfg, 'ref_path_visualize_point_radius', 0.022))
+        ref_path_line_cfg = VisualizationMarkersCfg(
+            prim_path='/Visuals/ref_path_line_markers',
+            markers={
+                'ref_pt': sim_utils.SphereCfg(
+                    radius=ref_r,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.35, 0.1)),
+                )
+            },
+        )
+        self._ref_path_line_markers = VisualizationMarkers(ref_path_line_cfg)
+        self._ref_path_line_markers.set_visibility(True)
         self._reward_components = ['rew_pitch_roll_angle', 'rew_pitch_roll_ang_vel', 'rew_height', 'rew_joint_velocity', 'rew_joint_acceleration', 'rew_foot_hit', 'rew_foot_path_tracking', 'rew_joint_limit', 'rew_action_rate', 'rew_action_smoothness', 'rew_contact_no_vel', 'rew_hip_pos']
         self._episode_reward_sums = {name: torch.zeros(num_envs, dtype=torch.float32, device=self.device) for name in self._reward_components}
         self._last_episode_reward_means = {name: 0.0 for name in self._reward_components}
+        arc_len = float(getattr(self.cfg, 'ref_path_quarter_arc_length_m', 10.0))
+        self._ref_path_arc_radius_m = quarter_circle_radius_from_arc_length(arc_len)
+        self._ref_path_progress_m = torch.zeros(num_envs, device=self.device)
+        self._ref_path_psi0 = torch.zeros(num_envs, device=self.device)
+        self._ref_path_origin_xy = torch.zeros((num_envs, 2), device=self.device)
+
+    def _advance_reference_path_progress(self, skip_env_ids: torch.Tensor) -> None:
+        """本步刚 reset 的环境不累计弧长，保证首帧观测对应 s=0。"""
+        if not getattr(self.cfg, 'ref_path_velocity_command_enabled', False):
+            return
+        if self._ref_path_progress_m is None:
+            return
+        V = float(getattr(self.cfg, 'ref_path_speed_m_s', 0.5))
+        delta = torch.full((self.num_envs,), V * self.step_dt, device=self.device, dtype=self._ref_path_progress_m.dtype)
+        if skip_env_ids.numel() > 0:
+            delta[skip_env_ids] = 0.0
+        self._ref_path_progress_m += delta
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         if hasattr(self, 'actions') and self.actions is not None:
@@ -318,6 +351,7 @@ class G1PlacingEnv(DirectRLEnv):
             self.actions.zero_()
         self._check_and_generate_targets()
         self._update_target_markers()
+        self._ensure_static_ref_path_visual()
 
     def _update_target_markers(self) -> None:
         if self._target_markers is None or self._foot_target_positions is None:
@@ -329,6 +363,69 @@ class G1PlacingEnv(DirectRLEnv):
         trans_np = marker_positions.detach().cpu().float().numpy()
         self._target_markers.visualize(translations=trans_np, marker_indices=np.zeros(num_envs, dtype=np.int32))
         self._update_path_line_markers()
+
+    def _ensure_static_ref_path_visual(self) -> None:
+        """参考路径在世界系中是固定几何：仅在首次就绪时画一次，不随回合重置或每步刷新。"""
+        if self._ref_path_static_visual_spawned:
+            return
+        if self._ref_path_line_markers is None:
+            return
+        if not getattr(self.cfg, 'ref_path_visualization_enabled', True):
+            off = np.array([[0.0, 0.0, -100.0]], dtype=np.float32)
+            self._ref_path_line_markers.visualize(
+                translations=off,
+                orientations=np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32),
+                scales=np.array([[1.0, 1.0, 1.0]], dtype=np.float32),
+                marker_indices=np.zeros(1, dtype=np.int32),
+            )
+            self._ref_path_static_visual_spawned = True
+            return
+        env_id = int(getattr(self.cfg, 'ref_path_visualize_env_id', 0))
+        if env_id < 0 or env_id >= self.num_envs:
+            env_id = 0
+        if not hasattr(self.robot, 'data') or self.robot.data.default_root_state is None:
+            return
+        drs = self.robot.data.default_root_state[env_id].clone()
+        drs[:3] = drs[:3] + self.scene.env_origins[env_id]
+        drs[2] = float(getattr(self.cfg, 'reset_root_height', 0.74))
+        origin_xy = drs[:2]
+        (_, _, yaw0) = euler_xyz_from_quat(drs[3:7].unsqueeze(0))
+        psi0 = yaw0[0]
+        z_g = float(self.scene.env_origins[env_id, 2]) + float(getattr(self.cfg, 'ref_path_visualize_z_offset_m', 0.005))
+        straight = float(getattr(self.cfg, 'ref_path_straight_m', 5.0))
+        arc_len = float(getattr(self.cfg, 'ref_path_quarter_arc_length_m', 10.0))
+        turn_left = bool(getattr(self.cfg, 'ref_path_turn_left', True))
+        n_s = int(getattr(self.cfg, 'ref_path_visualize_n_straight', 48))
+        n_a = int(getattr(self.cfg, 'ref_path_visualize_n_arc', 36))
+        pts = reference_path_polyline_world(
+            origin_xy,
+            psi0,
+            z_g,
+            straight,
+            self._ref_path_arc_radius_m,
+            arc_len,
+            turn_left=turn_left,
+            n_straight=n_s,
+            n_arc=n_a,
+        )
+        if pts.ndim != 2 or pts.shape[-1] != 3 or pts.shape[0] < 2:
+            return
+        trans_np = pts.detach().cpu().float().numpy()
+        num_m = int(trans_np.shape[0])
+        ident_q = np.tile(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), (num_m, 1))
+        unit_s = np.ones((num_m, 3), dtype=np.float32)
+        marker_indices_array = np.zeros(num_m, dtype=np.int32)
+        self._ref_path_line_markers.visualize(
+            translations=trans_np,
+            orientations=ident_q,
+            scales=unit_s,
+            marker_indices=marker_indices_array,
+        )
+        self._ref_path_static_visual_spawned = True
+
+    def _update_ref_path_trajectory_markers(self) -> None:
+        """兼容旧调用点：参考路径已改为 ``_ensure_static_ref_path_visual`` 一次性绘制。"""
+        self._ensure_static_ref_path_visual()
 
     def _update_path_line_markers(self) -> None:
         if self._path_line_markers is None:
@@ -457,6 +554,31 @@ class G1PlacingEnv(DirectRLEnv):
         self._prev_joint_pos_target = joint_pos_target.clone()
         self.robot.set_joint_position_target(joint_pos_target, joint_ids=None)
 
+    def _ref_path_command_world(self) -> torch.Tensor:
+        """参考路径在世界系下的期望 (vx, vy, ωz)，与观测末尾 3 维一致。未启用或缓冲未就绪时为 0。"""
+        num_envs = self.num_envs
+        dtype = self.robot.data.root_pos_w.dtype
+        out = torch.zeros((num_envs, 3), device=self.device, dtype=dtype)
+        if not getattr(self.cfg, 'ref_path_velocity_command_enabled', False):
+            return out
+        if self._ref_path_progress_m is None or self._ref_path_psi0 is None:
+            return out
+        straight = float(getattr(self.cfg, 'ref_path_straight_m', 5.0))
+        arc_len = float(getattr(self.cfg, 'ref_path_quarter_arc_length_m', 10.0))
+        turn_left = bool(getattr(self.cfg, 'ref_path_turn_left', True))
+        V = float(getattr(self.cfg, 'ref_path_speed_m_s', 0.5))
+        (vx_w, vy_w, wz_w) = reference_path_velocity_world(self._ref_path_progress_m, V, straight, self._ref_path_arc_radius_m, arc_len, self._ref_path_psi0, turn_left=turn_left)
+        out = torch.stack([vx_w, vy_w, wz_w], dim=1)
+        return out
+
+    def _path_driven_target_env_mask(self, env_ids: torch.Tensor) -> torch.Tensor:
+        if env_ids.numel() == 0:
+            return torch.zeros(0, dtype=torch.bool, device=self.device)
+        if not getattr(self.cfg, 'path_driven_target_enabled', False):
+            return torch.zeros(env_ids.shape[0], dtype=torch.bool, device=self.device)
+        skip = self._user_target_mode[env_ids] if self._user_target_mode is not None else torch.zeros(env_ids.shape[0], dtype=torch.bool, device=self.device)
+        return ~skip
+
     def _get_observations(self) -> dict:
         self._feet_contact_cache = None
         root_pos = self.robot.data.root_pos_w
@@ -498,7 +620,8 @@ class G1PlacingEnv(DirectRLEnv):
         feet_contact_flat = feet_contact_state
         feet_pos_flat = feet_pos_local.reshape(num_envs, -1)
         feet_quat_flat = feet_quat_local.reshape(num_envs, -1)
-        obs = torch.cat((root_pos, root_quat, root_lin_vel, root_ang_vel, self.joint_pos, self.joint_vel, target_offset_local, feet_contact_flat, feet_pos_flat, feet_quat_flat), dim=-1)
+        ref_cmd = self._ref_path_command_world()
+        obs = torch.cat((root_pos, root_quat, root_lin_vel, root_ang_vel, self.joint_pos, self.joint_vel, target_offset_local, feet_contact_flat, feet_pos_flat, feet_quat_flat, ref_cmd), dim=-1)
         if getattr(self.cfg, 'policy_observation_enabled', True):
             observations = {'policy': obs}
         else:
@@ -552,6 +675,84 @@ class G1PlacingEnv(DirectRLEnv):
             self._path_start_updated_for_target[env_ids] = False
         if self._aerial_hold_start_time is not None:
             self._aerial_hold_start_time[env_ids] = float('-inf')
+
+    def _generate_path_driven_target(self, env_ids: torch.Tensor, desired_vel_xy: torch.Tensor) -> None:
+        """根据期望世界系水平线速度，用 Raibert 式启发将运动意图分解为摆动脚落脚点。
+
+        Args:
+            env_ids: 环境索引，shape ``(K,)``。
+            desired_vel_xy: ``(K, 2)``，与 ``root_lin_vel_w[:, :2]`` 同为世界系 XY 速度。
+
+        说明:
+            使用当前 ``_target_foot_indices[env_ids]`` 作为摆动脚 (0 左脚 / 1 右脚)。
+            在踩中或延迟刷新后若需换脚，请在本函数调用前执行
+            ``self._target_foot_indices[env_ids] = 1 - self._target_foot_indices[env_ids]``。
+        """
+        if env_ids.numel() == 0:
+            return
+        if self._foot_target_positions is None or self._target_foot_indices is None:
+            return
+        feet_body_ids = self._get_feet_body_ids()
+        if len(feet_body_ids) < 2:
+            return
+        feet_body_ids = feet_body_ids[:2]
+        k = int(env_ids.numel())
+        if tuple(desired_vel_xy.shape) != (k, 2):
+            raise ValueError(f'desired_vel_xy 必须为 (K, 2) = ({k}, 2)，当前为 {tuple(desired_vel_xy.shape)}')
+        root_pos = self.robot.data.root_pos_w[env_ids]
+        root_quat = self.robot.data.root_quat_w[env_ids]
+        root_vel = self.robot.data.root_lin_vel_w[env_ids]
+        swing_foot_indices = self._target_foot_indices[env_ids]
+        T_stance = float(getattr(self.cfg, 'foot_path_duration_base_s', 0.55))
+        hip_width = float(getattr(self.cfg, 'foot_spacing_stand_m', 0.24)) / 2.0
+        direction_multiplier = torch.where(swing_foot_indices == 0, 1.0, -1.0).to(dtype=root_pos.dtype)
+        local_hip_pos = torch.zeros((k, 3), device=self.device, dtype=root_pos.dtype)
+        local_hip_pos[:, 1] = hip_width * direction_multiplier
+        world_hip_offset = quat_apply_yaw(root_quat, local_hip_pos)
+        p_hip = root_pos[:, :2] + world_hip_offset[:, :2]
+        p_symmetry = (T_stance / 2.0) * desired_vel_xy
+        k_v = float(getattr(self.cfg, 'path_driven_raibert_kv', 0.05))
+        v_error = root_vel[:, :2] - desired_vel_xy
+        p_feedback = k_v * v_error
+        target_xy = p_hip + p_symmetry + p_feedback
+        row_idx = torch.arange(k, device=self.device)
+        stance_foot_indices = 1 - swing_foot_indices
+        body_pos_subset = self.robot.data.body_pos_w[env_ids]
+        feet_pos_w = body_pos_subset[:, feet_body_ids, :]
+        stance_foot_pos = feet_pos_w[row_idx, stance_foot_indices, :2]
+        dist = torch.norm(target_xy - stance_foot_pos, dim=1)
+        max_reach = float(getattr(self.cfg, 'foot_target_max_distance', 0.15))
+        exceed_mask = dist > max_reach
+        if torch.any(exceed_mask):
+            scale = max_reach / dist[exceed_mask]
+            target_xy[exceed_mask] = stance_foot_pos[exceed_mask] + (target_xy[exceed_mask] - stance_foot_pos[exceed_mask]) * scale.unsqueeze(1)
+        target_positions = torch.zeros(k, 3, device=self.device, dtype=root_pos.dtype)
+        target_positions[:, :2] = target_xy
+        target_positions[:, 2] = self.scene.env_origins[env_ids, 2]
+        self._foot_target_positions[env_ids] = target_positions
+        swing_idx = self._target_foot_indices[env_ids]
+        if self._swing_foot_path_start is not None:
+            self._swing_foot_path_start[env_ids] = feet_pos_w[row_idx, swing_idx, :].clone()
+        if self._path_start_time is not None:
+            self._path_start_time[env_ids] = self.episode_length_buf[env_ids].float() * self.step_dt
+        if self._path_start_updated_for_target is not None:
+            self._path_start_updated_for_target[env_ids] = False
+        if self._aerial_hold_start_time is not None:
+            self._aerial_hold_start_time[env_ids] = float('-inf')
+        if self._target_regenerate_deadline is not None:
+            self._target_regenerate_deadline[env_ids] = float('nan')
+        current_time = self.episode_length_buf[env_ids].float() * self.step_dt
+        self._target_generation_time[env_ids] = current_time
+        self._target_hit[env_ids] = False
+        if self._last_touchdown_time is not None:
+            self._last_touchdown_time[env_ids] = float('-inf')
+        self._swing_foot_lifted[env_ids] = False
+        if self._swing_foot_contact_prev is not None:
+            self._swing_foot_contact_prev[env_ids] = True
+        if self._foot_land_rewarded is not None:
+            self._foot_land_rewarded[env_ids] = False
+        if self._swing_air_accum_s is not None:
+            self._swing_air_accum_s[env_ids] = 0.0
 
     def _generate_random_target(self, env_ids: torch.Tensor, *, alternate_swing: bool=False) -> None:
         if len(env_ids) == 0:
@@ -647,17 +848,37 @@ class G1PlacingEnv(DirectRLEnv):
         if self._target_regenerate_deadline is not None:
             delay_ready = torch.isfinite(self._target_regenerate_deadline) & (t_now >= self._target_regenerate_deadline) & ~skip_auto
             env_ids_delay = torch.where(delay_ready)[0]
-            if len(env_ids_delay) > 0:
+            if env_ids_delay.numel() > 0:
                 self._target_regenerate_deadline[env_ids_delay] = float('nan')
-                self._generate_random_target(env_ids_delay, alternate_swing=True)
+                dtype = self.robot.data.root_pos_w.dtype
+                vx = float(getattr(self.cfg, 'ref_path_speed_m_s', 0.5))
+                n = int(env_ids_delay.numel())
+                desired_velocity = torch.tensor([[vx, 0.0]], device=self.device, dtype=dtype).repeat(n, 1)
+                self._generate_path_driven_target(env_ids_delay, desired_velocity)
+                self._target_foot_indices[env_ids_delay] = 1 - self._target_foot_indices[env_ids_delay]
         not_generated = torch.isinf(self._target_generation_time) & (self._target_generation_time < 0) & ~skip_auto
         env_ids_init = torch.where(not_generated)[0]
-        if len(env_ids_init) > 0:
-            self._generate_random_target(env_ids_init)
+        if env_ids_init.numel() > 0:
+            use_pd = self._path_driven_target_env_mask(env_ids_init)
+            env_pd = env_ids_init[use_pd]
+            env_rd = env_ids_init[~use_pd]
+            if env_pd.numel() > 0:
+                v_w = self._ref_path_command_world()
+                self._generate_path_driven_target(env_pd, v_w[env_pd, :2])
+            if env_rd.numel() > 0:
+                self._generate_random_target(env_rd, alternate_swing=False)
         if self._target_hit is not None:
             env_ids_hit = torch.where(self._target_hit & ~skip_auto)[0]
-            if len(env_ids_hit) > 0:
-                self._generate_random_target(env_ids_hit, alternate_swing=True)
+            if env_ids_hit.numel() > 0:
+                use_pd = self._path_driven_target_env_mask(env_ids_hit)
+                env_pd = env_ids_hit[use_pd]
+                env_rd = env_ids_hit[~use_pd]
+                if env_pd.numel() > 0:
+                    self._target_foot_indices[env_pd] = 1 - self._target_foot_indices[env_pd]
+                    v_w = self._ref_path_command_world()
+                    self._generate_path_driven_target(env_pd, v_w[env_pd, :2])
+                if env_rd.numel() > 0:
+                    self._generate_random_target(env_rd, alternate_swing=True)
             env_ids_user_hit = torch.where(self._target_hit & skip_auto)[0]
             if len(env_ids_user_hit) > 0:
                 self._clear_user_target(env_ids_user_hit)
@@ -725,6 +946,7 @@ class G1PlacingEnv(DirectRLEnv):
             self._swing_air_accum_s[env_ids] = 0.0
         self._next_is_follow[env_ids] = False
         self._update_target_markers()
+        self._update_ref_path_trajectory_markers()
         return True
 
     def _reward_curriculum_components(self, step: int, curriculum: list, mode: str='step', steps_per_iter: int=24) -> list[str] | None:
@@ -1007,6 +1229,7 @@ class G1PlacingEnv(DirectRLEnv):
                 if torch.any(hit_target):
                     self._check_and_generate_targets()
                     self._update_target_markers()
+                    self._update_ref_path_trajectory_markers()
         self._initialize_joint_limits()
         joint_limit_violation = torch.zeros(num_envs, device=self.device)
         buffer_width = self.cfg.joint_limit_buffer
@@ -1091,6 +1314,7 @@ class G1PlacingEnv(DirectRLEnv):
             _add_if_active('rew_hip_pos', rew_hip_pos)
         self._check_and_generate_targets()
         self._update_target_markers()
+        self._update_ref_path_trajectory_markers()
         return total_reward
 
     def get_reward_breakdown(self) -> dict:
@@ -1246,6 +1470,15 @@ class G1PlacingEnv(DirectRLEnv):
         if getattr(self.cfg, 'event_curriculum_enabled', False) and self._event_next_push_at is not None:
             self._apply_event_curriculum_mass(env_ids)
             self._reschedule_event_push_times_on_reset(env_ids)
+        ref_need_pose = getattr(self.cfg, 'ref_path_velocity_command_enabled', False) or getattr(self.cfg, 'ref_path_visualization_enabled', False)
+        env_ids_tensor = env_ids if isinstance(env_ids, torch.Tensor) else torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        if ref_need_pose and self._ref_path_psi0 is not None and (self._ref_path_origin_xy is not None) and env_ids_tensor.numel() > 0:
+            dq = default_root_state[:, 3:7]
+            (_, _, yaw0) = euler_xyz_from_quat(dq)
+            self._ref_path_psi0[env_ids_tensor] = yaw0
+            self._ref_path_origin_xy[env_ids_tensor] = default_root_state[:, :2].clone()
+        if getattr(self.cfg, 'ref_path_velocity_command_enabled', False) and self._ref_path_progress_m is not None and env_ids_tensor.numel() > 0:
+            self._ref_path_progress_m[env_ids_tensor] = 0.0
 
 @torch.jit.script
 def compute_rewards(rew_scale_pitch_roll_angle: float, rew_scale_height: float, rew_scale_joint_velocity: float, rew_scale_joint_acceleration: float, rew_scale_foot_hit: float, rew_scale_foot_path_tracking: float, rew_scale_joint_limit: float, pitch_angle: torch.Tensor, roll_angle: torch.Tensor, joint_vel: torch.Tensor, joint_acc: torch.Tensor, foot_hit: torch.Tensor, foot_path_tracking_reward: torch.Tensor, joint_limit_violation: torch.Tensor, height_violation: torch.Tensor, pitch_roll_swing_multiplier: torch.Tensor, rew_pitch_roll_ang_vel: torch.Tensor, rew_action_rate: torch.Tensor, rew_action_smoothness: torch.Tensor, rew_contact_no_vel: torch.Tensor, rew_hip_pos: torch.Tensor):

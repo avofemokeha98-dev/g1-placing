@@ -18,7 +18,8 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     """G1机器人踩点环境配置"""
     decimation = 2
     episode_length_s = 15.0
-    observation_space = 106
+    # 原 106 维 + 3 维参考路径期望速度（世界系 vx, vy, ωz，与 root_lin_vel_w 一致）
+    observation_space = 109
     action_space = 37
     policy_observation_enabled = True
     state_space = 0
@@ -107,3 +108,19 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     reward_curriculum_mode = 'iteration'
     reward_curriculum_steps_per_iteration = 24
     reward_curriculum = [{'iter_start': 0, 'iter_end': 1500, 'components': ['rew_pitch_roll_angle', 'rew_pitch_roll_ang_vel', 'rew_height', 'rew_joint_velocity', 'rew_joint_acceleration', 'rew_joint_limit', 'rew_action_rate', 'rew_action_smoothness', 'rew_contact_no_vel', 'rew_hip_pos']}, {'iter_start': 1500, 'iter_end': None, 'components': ['rew_pitch_roll_angle', 'rew_pitch_roll_ang_vel', 'rew_height', 'rew_joint_velocity', 'rew_joint_acceleration', 'rew_joint_limit', 'rew_foot_hit', 'rew_foot_path_tracking', 'rew_action_rate', 'rew_action_smoothness', 'rew_contact_no_vel', 'rew_hip_pos']}]
+    # 地面参考路径 + 观测末尾 3 维期望速度（世界系 vx,vy,ωz；关闭时仍占位 109 维）
+    ref_path_velocity_command_enabled: bool = True
+    ref_path_speed_m_s: float = 0.5
+    ref_path_straight_m: float = 5.0  # 地面平面内沿重置航向的直线段长度 [m]
+    ref_path_quarter_arc_length_m: float = 10.0  # 紧随其后的 90° 圆弧的弧长 [m]（非半径；R=2L/π）
+    ref_path_turn_left: bool = True
+    # 视口绘制上述**贴地**参考折线（橙）；与青色「抬脚空间曲线」不同
+    ref_path_visualization_enabled: bool = True
+    ref_path_visualize_env_id: int = 0
+    ref_path_visualize_z_offset_m: float = 0.005  # 相对 env 地面略抬高，减轻与地片 z-fight
+    ref_path_visualize_n_straight: int = 48
+    ref_path_visualize_n_arc: int = 36
+    ref_path_visualize_point_radius: float = 0.022  # 贴地路径用球体点绘制（避免圆柱 instancing 朝向竖直）
+    # Raibert 式路径驱动落脚点：为 True 时在非用户模式下用期望速度分解落点；play/测试时与 ref_path 一起开
+    path_driven_target_enabled: bool = True
+    path_driven_raibert_kv: float = 0.05
