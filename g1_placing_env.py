@@ -5,18 +5,21 @@ import numpy as np
 import torch
 import isaaclab.envs.mdp as mdp
 import isaaclab.sim as sim_utils
+import isaacsim.core.utils.prims as prim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.envs.common import VecEnvStepReturn
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+from isaaclab.sim.spawners.meshes.meshes import _spawn_mesh_geom_from_mesh
+from isaaclab.sim.spawners.meshes.meshes_cfg import MeshCfg
 from isaaclab.sensors import ContactSensor, ContactSensorCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, quat_apply_yaw, quat_from_angle_axis, quat_inv, quat_mul, quat_rotate_inverse, sample_uniform
 from .g1_placing_env_cfg import G1PlacingEnvCfg
 from .placing_joint_lock import apply_locked_joint_targets, collect_locked_joint_ids
 from .placing_joint_limits import reward_joint_limit_interval
-from .placing_reference_path import quarter_circle_radius_from_arc_length, reference_path_polyline_world, reference_path_velocity_world
+from .placing_reference_path import polyline_ground_ribbon_trimesh, quarter_circle_radius_from_arc_length, reference_path_polyline_world, reference_path_velocity_world
 
 class G1PlacingEnv(DirectRLEnv):
     cfg: G1PlacingEnvCfg
@@ -299,18 +302,6 @@ class G1PlacingEnv(DirectRLEnv):
         )
         self._path_line_markers = VisualizationMarkers(path_line_cfg)
         self._path_line_markers.set_visibility(True)
-        ref_r = float(getattr(self.cfg, 'ref_path_visualize_point_radius', 0.022))
-        ref_path_line_cfg = VisualizationMarkersCfg(
-            prim_path='/Visuals/ref_path_line_markers',
-            markers={
-                'ref_pt': sim_utils.SphereCfg(
-                    radius=ref_r,
-                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.35, 0.1)),
-                )
-            },
-        )
-        self._ref_path_line_markers = VisualizationMarkers(ref_path_line_cfg)
-        self._ref_path_line_markers.set_visibility(True)
         self._reward_components = ['rew_pitch_roll_angle', 'rew_pitch_roll_ang_vel', 'rew_height', 'rew_joint_velocity', 'rew_joint_acceleration', 'rew_foot_hit', 'rew_foot_path_tracking', 'rew_joint_limit', 'rew_action_rate', 'rew_action_smoothness', 'rew_contact_no_vel', 'rew_hip_pos']
         self._episode_reward_sums = {name: torch.zeros(num_envs, dtype=torch.float32, device=self.device) for name in self._reward_components}
         self._last_episode_reward_means = {name: 0.0 for name in self._reward_components}
@@ -365,25 +356,20 @@ class G1PlacingEnv(DirectRLEnv):
         self._update_path_line_markers()
 
     def _ensure_static_ref_path_visual(self) -> None:
-        """参考路径在世界系中是固定几何：仅在首次就绪时画一次，不随回合重置或每步刷新。"""
+        """参考路径在世界系中是固定几何：首次就绪时生成一条贴地 USD 带状网格（连续路面），不随回合刷新。"""
         if self._ref_path_static_visual_spawned:
             return
-        if self._ref_path_line_markers is None:
-            return
         if not getattr(self.cfg, 'ref_path_visualization_enabled', True):
-            off = np.array([[0.0, 0.0, -100.0]], dtype=np.float32)
-            self._ref_path_line_markers.visualize(
-                translations=off,
-                orientations=np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32),
-                scales=np.array([[1.0, 1.0, 1.0]], dtype=np.float32),
-                marker_indices=np.zeros(1, dtype=np.int32),
-            )
             self._ref_path_static_visual_spawned = True
             return
         env_id = int(getattr(self.cfg, 'ref_path_visualize_env_id', 0))
         if env_id < 0 or env_id >= self.num_envs:
             env_id = 0
         if not hasattr(self.robot, 'data') or self.robot.data.default_root_state is None:
+            return
+        prim_path = '/Visuals/ref_path_road_ribbon'
+        if prim_utils.is_prim_path_valid(prim_path):
+            self._ref_path_static_visual_spawned = True
             return
         drs = self.robot.data.default_root_state[env_id].clone()
         drs[:3] = drs[:3] + self.scene.env_origins[env_id]
@@ -411,16 +397,16 @@ class G1PlacingEnv(DirectRLEnv):
         if pts.ndim != 2 or pts.shape[-1] != 3 or pts.shape[0] < 2:
             return
         trans_np = pts.detach().cpu().float().numpy()
-        num_m = int(trans_np.shape[0])
-        ident_q = np.tile(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), (num_m, 1))
-        unit_s = np.ones((num_m, 3), dtype=np.float32)
-        marker_indices_array = np.zeros(num_m, dtype=np.int32)
-        self._ref_path_line_markers.visualize(
-            translations=trans_np,
-            orientations=ident_q,
-            scales=unit_s,
-            marker_indices=marker_indices_array,
+        half_w = float(getattr(self.cfg, 'ref_path_visualize_road_half_width_m', 0.15))
+        ribbon = polyline_ground_ribbon_trimesh(trans_np, half_w)
+        mesh_cfg = MeshCfg(
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(1.0, 0.35, 0.1),
+                roughness=0.55,
+                metallic=0.05,
+            ),
         )
+        _spawn_mesh_geom_from_mesh(prim_path, mesh_cfg, ribbon, None, None, None)
         self._ref_path_static_visual_spawned = True
 
     def _update_ref_path_trajectory_markers(self) -> None:

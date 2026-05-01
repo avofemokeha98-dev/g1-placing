@@ -9,7 +9,10 @@
 """
 from __future__ import annotations
 import math
+
+import numpy as np
 import torch
+import trimesh
 
 
 def quarter_circle_radius_from_arc_length(arc_length_m: float) -> float:
@@ -77,6 +80,52 @@ def reference_path_polyline_world(
     all_xy = torch.cat([pts_straight_xy, pts_arc_xy[1:]], dim=0)
     z_coords = torch.full((all_xy.shape[0], 1), float(z_world), device=device, dtype=dtype)
     return torch.cat([all_xy, z_coords], dim=1)
+
+
+def polyline_ground_ribbon_trimesh(points_xyz: np.ndarray, half_width_m: float) -> trimesh.Trimesh:
+    """将地面折线挤出为带状网格（连续路面），法线朝上。
+
+    Args:
+        points_xyz: ``[N, 3]`` 世界系路径采样点（近似共面）。
+        half_width_m: 带条半宽（米），总宽度为 ``2 * half_width_m``。
+
+    Returns:
+        双面可见的三角条带网格，无物理、仅用于可视化。
+    """
+    pts = np.asarray(points_xyz, dtype=np.float64)
+    if pts.shape[0] < 2:
+        raise ValueError('polyline_ground_ribbon_trimesh requires at least 2 points')
+    if half_width_m <= 0.0:
+        raise ValueError('half_width_m must be positive')
+    n = pts.shape[0]
+    tangents = np.zeros((n, 3), dtype=np.float64)
+    for i in range(n):
+        if i == 0:
+            d = pts[1] - pts[0]
+        elif i == n - 1:
+            d = pts[-1] - pts[-2]
+        else:
+            d = pts[i + 1] - pts[i - 1]
+        norm = float(np.linalg.norm(d))
+        if norm < 1e-09:
+            d = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        else:
+            d = d / norm
+        tangents[i] = d
+    perp = np.stack([-tangents[:, 1], tangents[:, 0], np.zeros(n, dtype=np.float64)], axis=1)
+    pn = np.linalg.norm(perp[:, :2], axis=1, keepdims=True) + 1e-09
+    perp[:, 0:2] /= pn
+    w = float(half_width_m)
+    left = pts + w * perp
+    right = pts - w * perp
+    vertices = np.zeros((2 * n, 3), dtype=np.float64)
+    vertices[0::2] = left
+    vertices[1::2] = right
+    faces: list[list[int]] = []
+    for i in range(n - 1):
+        faces.append([2 * i, 2 * i + 1, 2 * (i + 1)])
+        faces.append([2 * i + 1, 2 * (i + 1) + 1, 2 * (i + 1)])
+    return trimesh.Trimesh(vertices=vertices, faces=np.asarray(faces, dtype=np.int64), process=False)
 
 
 def reference_path_velocity_world(

@@ -114,13 +114,13 @@ class G1PlacingEnvCfg(DirectRLEnvCfg):
     ref_path_straight_m: float = 5.0  # 地面平面内沿重置航向的直线段长度 [m]
     ref_path_quarter_arc_length_m: float = 10.0  # 紧随其后的 90° 圆弧的弧长 [m]（非半径；R=2L/π）
     ref_path_turn_left: bool = True
-    # 视口绘制上述**贴地**参考折线（橙）；与青色「抬脚空间曲线」不同
+    # 视口绘制上述**贴地**参考路径（橙）；USD 带状网格连续路面；与青色「抬脚空间曲线」不同
     ref_path_visualization_enabled: bool = True
     ref_path_visualize_env_id: int = 0
     ref_path_visualize_z_offset_m: float = 0.005  # 相对 env 地面略抬高，减轻与地片 z-fight
     ref_path_visualize_n_straight: int = 48
     ref_path_visualize_n_arc: int = 36
-    ref_path_visualize_point_radius: float = 0.022  # 贴地路径用球体点绘制（避免圆柱 instancing 朝向竖直）
+    ref_path_visualize_road_half_width_m: float = 0.15  # 路面半宽（m），总宽约 2× 该值
     # Raibert 式路径驱动落脚点：为 True 时在非用户模式下用期望速度分解落点；play/测试时与 ref_path 一起开
     path_driven_target_enabled: bool = True
     path_driven_raibert_kv: float = 0.05
